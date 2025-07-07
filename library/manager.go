@@ -161,61 +161,61 @@ func (lm *LibraryManager) UpdateBookContentFromFile(id int64, path string) error
 // If the book is available, it checks it out first.
 // If the book is checked out, only allows reading if it's checked out by the same member.
 func (lm *LibraryManager) ReadBook(bookID, memberID int64) error {
-	// Get book details
-	book, err := lm.db.GetBook(bookID)
+	// Single optimized query for all validation
+	validation, err := lm.db.ValidateReadBookAccess(bookID, memberID)
 	if err != nil {
-		return fmt.Errorf("book not found: %w", err)
+		return fmt.Errorf("database error: %w", err)
 	}
 
-	// Verify member exists
-	member, err := lm.db.GetMember(memberID)
-	if err != nil {
-		return fmt.Errorf("member not found: %w", err)
+	// Check validation results
+	if !validation.BookExists {
+		return fmt.Errorf("book not found")
 	}
 
-	// Check access permissions and handle checkout if needed
-	if book.Available {
-		// Book is available, check it out for the member
-		if err := lm.db.CheckoutBook(bookID, memberID); err != nil {
-			return fmt.Errorf("failed to check out book: %w", err)
-		}
-		fmt.Printf("Book '%s' checked out to %s for reading.\n", book.Title, member.Name)
-	} else if book.BorrowerID != memberID {
-		// Book is checked out by someone else
-		borrower, _ := lm.db.GetMember(book.BorrowerID)
-		borrowerName := "Unknown"
-		if borrower != nil {
-			borrowerName = borrower.Name
-		}
-		return fmt.Errorf("book is currently checked out by %s (ID: %d)", borrowerName, book.BorrowerID)
+	if !validation.MemberExists {
+		return fmt.Errorf("member not found")
 	}
-	// If book.BorrowerID == memberID, member already has the book checked out
 
-	// Check if book has content
-	if strings.TrimSpace(book.Content) == "" {
+	if !validation.HasContent {
 		return fmt.Errorf("book has no content to read")
 	}
 
-	// Start the reading interface
-	return lm.startReadingInterface(book, member)
-}
-
-// startReadingInterface provides a paginated reading experience.
-func (lm *LibraryManager) startReadingInterface(book *Book, member *Member) error {
-	const pageSize = 1500
-	content := book.Content
-
-	// Split content into pages
-	pages := make([]string, 0)
-	for i := 0; i < len(content); i += pageSize {
-		end := i + pageSize
-		if end > len(content) {
-			end = len(content)
+	// Additional validation: check for whitespace-only content using Go's more robust trimming
+	// This handles edge cases where SQLite TRIM might not catch all whitespace types
+	if validation.BookContentLength > 0 {
+		// Get a small sample of content to check if it's all whitespace
+		sampleContent, err := lm.db.GetBookContentChunk(bookID, 0, 1000) // Check first 1000 chars
+		if err != nil {
+			return fmt.Errorf("failed to validate content: %w", err)
 		}
-		pages = append(pages, content[i:end])
+		if strings.TrimSpace(sampleContent) == "" {
+			return fmt.Errorf("book has no content to read")
+		}
 	}
 
-	if len(pages) == 0 {
+	// Handle auto-checkout
+	if validation.CanAutoCheckout {
+		if err := lm.db.CheckoutBook(bookID, memberID); err != nil {
+			return fmt.Errorf("failed to check out book: %w", err)
+		}
+		fmt.Printf("Book '%s' checked out to %s for reading.\n", validation.BookTitle, validation.MemberName)
+	} else if !validation.CanRead {
+		// Book is checked out by someone else - don't expose borrower information
+		return fmt.Errorf("book is currently checked out by another member")
+	}
+
+	// Start the reading interface with efficient pagination
+	return lm.startReadingInterface(bookID, validation.BookTitle, validation.BookAuthor,
+		validation.MemberName, validation.BookContentLength)
+}
+
+// startReadingInterface provides a paginated reading experience with lazy loading.
+func (lm *LibraryManager) startReadingInterface(bookID int64, title, author, memberName string, totalLength int) error {
+	const pageSize = 1500
+
+	// Calculate total pages
+	totalPages := (totalLength + pageSize - 1) / pageSize
+	if totalPages == 0 {
 		return fmt.Errorf("book has no content to display")
 	}
 
@@ -226,26 +226,37 @@ func (lm *LibraryManager) startReadingInterface(book *Book, member *Member) erro
 	fmt.Print("\033[2J\033[H") // Clear screen and move cursor to top
 
 	for {
+		// Lazy load current page content
+		offset := currentPage * pageSize
+		pageContent, err := lm.db.GetBookContentChunk(bookID, offset, pageSize)
+		if err != nil {
+			return fmt.Errorf("failed to load page content: %w", err)
+		}
+
 		// Display header
 		fmt.Printf("═══════════════════════════════════════════════════════════════════════════════\n")
-		fmt.Printf("📖 %s by %s\n", book.Title, book.Author)
-		fmt.Printf("Reader: %s | Page %d of %d\n", member.Name, currentPage+1, len(pages))
+		fmt.Printf("📖 %s by %s\n", title, author)
+		fmt.Printf("Reader: %s | Page %d of %d\n", memberName, currentPage+1, totalPages)
 		fmt.Printf("═══════════════════════════════════════════════════════════════════════════════\n\n")
 
 		// Display current page content
-		fmt.Println(pages[currentPage])
+		fmt.Println(pageContent)
 
-		// Display navigation footer
+		// Display navigation footer (only show navigation for multi-page books)
 		fmt.Printf("\n═══════════════════════════════════════════════════════════════════════════════\n")
-		fmt.Printf("Navigation: [n]ext | [p]revious | [g]oto page | [q]uit\n")
-		if currentPage > 0 {
-			fmt.Printf("← Previous")
-		}
-		if currentPage < len(pages)-1 {
+		if totalPages == 1 {
+			fmt.Printf("Navigation: [q]uit\n")
+		} else {
+			fmt.Printf("Navigation: [n]ext | [p]revious | [g]oto page | [q]uit\n")
 			if currentPage > 0 {
-				fmt.Printf(" | ")
+				fmt.Printf("← Previous")
 			}
-			fmt.Printf("Next →")
+			if currentPage < totalPages-1 {
+				if currentPage > 0 {
+					fmt.Printf(" | ")
+				}
+				fmt.Printf("Next →")
+			}
 		}
 		fmt.Printf("\n> ")
 
@@ -261,7 +272,12 @@ func (lm *LibraryManager) startReadingInterface(book *Book, member *Member) erro
 
 		switch input {
 		case "n", "next":
-			if currentPage < len(pages)-1 {
+			if totalPages == 1 {
+				fmt.Println("📖 This book has only one page!")
+				fmt.Println("Press Enter to continue...")
+				scanner.Scan()
+				fmt.Print("\033[2J\033[H")
+			} else if currentPage < totalPages-1 {
 				currentPage++
 			} else {
 				fmt.Println("📖 You're already on the last page!")
@@ -270,7 +286,12 @@ func (lm *LibraryManager) startReadingInterface(book *Book, member *Member) erro
 				fmt.Print("\033[2J\033[H")
 			}
 		case "p", "prev", "previous":
-			if currentPage > 0 {
+			if totalPages == 1 {
+				fmt.Println("📖 This book has only one page!")
+				fmt.Println("Press Enter to continue...")
+				scanner.Scan()
+				fmt.Print("\033[2J\033[H")
+			} else if currentPage > 0 {
 				currentPage--
 			} else {
 				fmt.Println("📖 You're already on the first page!")
@@ -279,31 +300,44 @@ func (lm *LibraryManager) startReadingInterface(book *Book, member *Member) erro
 				fmt.Print("\033[2J\033[H")
 			}
 		case "g", "goto":
-			fmt.Printf("Enter page number (1-%d): ", len(pages))
-			if scanner.Scan() {
-				if pageNum, err := fmt.Sscanf(scanner.Text(), "%d", &currentPage); err == nil && pageNum == 1 {
-					currentPage-- // Convert to 0-based index
-					if currentPage < 0 {
-						currentPage = 0
-					} else if currentPage >= len(pages) {
-						currentPage = len(pages) - 1
+			if totalPages == 1 {
+				fmt.Println("📖 This book has only one page!")
+				fmt.Println("Press Enter to continue...")
+				scanner.Scan()
+				fmt.Print("\033[2J\033[H")
+			} else {
+				fmt.Printf("Enter page number (1-%d): ", totalPages)
+				if scanner.Scan() {
+					var pageNum int
+					if n, err := fmt.Sscanf(scanner.Text(), "%d", &pageNum); err == nil && n == 1 {
+						pageNum-- // Convert to 0-based index
+						if pageNum < 0 {
+							pageNum = 0
+						} else if pageNum >= totalPages {
+							pageNum = totalPages - 1
+						}
+						currentPage = pageNum
+					} else {
+						fmt.Println("Invalid page number!")
+						fmt.Println("Press Enter to continue...")
+						scanner.Scan()
 					}
-				} else {
-					fmt.Println("Invalid page number!")
-					fmt.Println("Press Enter to continue...")
-					scanner.Scan()
 				}
+				fmt.Print("\033[2J\033[H")
 			}
-			fmt.Print("\033[2J\033[H")
 		case "q", "quit", "exit":
-			fmt.Printf("📖 Finished reading '%s'. The book remains checked out to you.\n", book.Title)
+			fmt.Printf("📖 Finished reading '%s'. The book remains checked out to you.\n", title)
 			return nil
 		case "":
 			// Just refresh the display
 			continue
 		default:
 			fmt.Printf("Unknown command: %s\n", input)
-			fmt.Println("Use: [n]ext, [p]revious, [g]oto, or [q]uit")
+			if totalPages == 1 {
+				fmt.Println("Use: [q]uit")
+			} else {
+				fmt.Println("Use: [n]ext, [p]revious, [g]oto, or [q]uit")
+			}
 			fmt.Println("Press Enter to continue...")
 			scanner.Scan()
 			fmt.Print("\033[2J\033[H")

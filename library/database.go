@@ -508,3 +508,80 @@ func (d *Database) CancelReservation(bookID, memberID int64) error {
 	}
 	return nil
 }
+
+// ValidateReadBookAccess performs all validation for read book access in one optimized query.
+// Returns book content length, member name, current borrower ID (if any), and access validation.
+type ReadBookValidation struct {
+	BookExists        bool
+	BookTitle         string
+	BookAuthor        string
+	BookAvailable     bool
+	BookBorrowerID    int64
+	BookContentLength int
+	HasContent        bool
+	MemberExists      bool
+	MemberName        string
+	CanAutoCheckout   bool // Book is available for checkout
+	CanRead           bool // Member can read (owns book or can auto-checkout)
+}
+
+func (d *Database) ValidateReadBookAccess(bookID, memberID int64) (*ReadBookValidation, error) {
+	// Single optimized query using LEFT JOINs to distinguish book vs member existence
+	query := `
+		SELECT 
+			b.id IS NOT NULL as book_exists,
+			COALESCE(b.title, '') as book_title,
+			COALESCE(b.author, '') as book_author,
+			COALESCE(b.available, 0) as book_available,
+			COALESCE(b.borrower_id, 0) as book_borrower_id,
+			LENGTH(COALESCE(b.content, '')) as content_length,
+			CASE 
+				WHEN b.content IS NULL THEN 0
+				WHEN TRIM(b.content, ' \t\n\r') = '' THEN 0
+				ELSE 1
+			END as has_content,
+			m.id IS NOT NULL as member_exists,
+			COALESCE(m.name, '') as member_name
+		FROM (SELECT ? as bid, ? as mid) params
+		LEFT JOIN books b ON b.id = params.bid
+		LEFT JOIN members m ON m.id = params.mid
+	`
+
+	var validation ReadBookValidation
+	err := d.db.QueryRow(query, bookID, memberID).Scan(
+		&validation.BookExists,
+		&validation.BookTitle,
+		&validation.BookAuthor,
+		&validation.BookAvailable,
+		&validation.BookBorrowerID,
+		&validation.BookContentLength,
+		&validation.HasContent,
+		&validation.MemberExists,
+		&validation.MemberName,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine access rights
+	validation.CanAutoCheckout = validation.BookExists && validation.BookAvailable
+	validation.CanRead = validation.BookExists && validation.MemberExists && validation.HasContent &&
+		(validation.BookAvailable || validation.BookBorrowerID == memberID)
+
+	// Only consider content relevant if both book and member exist
+	if !validation.BookExists || !validation.MemberExists {
+		validation.HasContent = false
+	}
+
+	return &validation, nil
+}
+
+// GetBookContentChunk retrieves a specific chunk of book content for pagination.
+// This enables memory-efficient reading of large books.
+func (d *Database) GetBookContentChunk(bookID int64, offset, length int) (string, error) {
+	query := "SELECT SUBSTR(content, ?, ?) FROM books WHERE id = ?"
+	var chunk string
+	err := d.db.QueryRow(query, offset+1, length, bookID).Scan(&chunk) // SQL SUBSTR is 1-indexed
+	return chunk, err
+}

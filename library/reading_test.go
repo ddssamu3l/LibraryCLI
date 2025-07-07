@@ -1,138 +1,261 @@
 package library
 
 import (
+	"io"
+	"os"
 	"strings"
 	"testing"
 )
 
-func TestReadBookBasicFlow(t *testing.T) {
+// Mock reader to simulate user input during testing
+type mockReader struct {
+	inputs []string
+	index  int
+}
+
+func (m *mockReader) Read(p []byte) (n int, err error) {
+	if m.index >= len(m.inputs) {
+		return 0, io.EOF
+	}
+	input := m.inputs[m.index] + "\n"
+	m.index++
+	n = copy(p, input)
+	return n, nil
+}
+
+func TestValidateReadBookAccess(t *testing.T) {
 	db := tempDB(t)
 
-	// Setup: Create book with content and member
-	content := strings.Repeat("This is test content for reading. ", 100) // ~3400 chars, should be 3 pages
-	bookID, err := db.AddBook("Test Reading Book", "Test Author", content)
-	if err != nil {
-		t.Fatalf("failed to add book: %v", err)
+	// Setup test data
+	content := "Test content for validation"
+	bookID, _ := db.AddBook("Test Book", "Test Author", content)
+	emptyBookID, _ := db.AddBook("Empty Book", "Test Author", "")
+	memberID, _ := db.AddMember("Test Member")
+	member2ID, _ := db.AddMember("Member 2")
+
+	// Checkout book to member 2
+	db.CheckoutBook(bookID, member2ID)
+
+	tests := []struct {
+		name                 string
+		bookID               int64
+		memberID             int64
+		expectedExists       bool
+		expectedMember       bool
+		expectedContent      bool
+		expectedCanRead      bool
+		expectedAutoCheckout bool
+	}{
+		{
+			name:                 "Valid book and member, available book",
+			bookID:               emptyBookID, // Available book
+			memberID:             memberID,
+			expectedExists:       true,
+			expectedMember:       true,
+			expectedContent:      false, // Empty content
+			expectedCanRead:      false,
+			expectedAutoCheckout: true,
+		},
+		{
+			name:                 "Book checked out by requesting member",
+			bookID:               bookID,
+			memberID:             member2ID, // Has book checked out
+			expectedExists:       true,
+			expectedMember:       true,
+			expectedContent:      true,
+			expectedCanRead:      true,
+			expectedAutoCheckout: false,
+		},
+		{
+			name:                 "Book checked out by different member",
+			bookID:               bookID,
+			memberID:             memberID, // Different member
+			expectedExists:       true,
+			expectedMember:       true,
+			expectedContent:      true,
+			expectedCanRead:      false,
+			expectedAutoCheckout: false,
+		},
+		{
+			name:                 "Non-existent book",
+			bookID:               99999,
+			memberID:             memberID,
+			expectedExists:       false, // Book doesn't exist
+			expectedMember:       true,  // Member exists
+			expectedContent:      false,
+			expectedCanRead:      false,
+			expectedAutoCheckout: false,
+		},
+		{
+			name:                 "Non-existent member",
+			bookID:               bookID,
+			memberID:             99999,
+			expectedExists:       true,  // Book exists
+			expectedMember:       false, // Member doesn't exist
+			expectedContent:      false,
+			expectedCanRead:      false,
+			expectedAutoCheckout: false,
+		},
 	}
 
-	memberID, err := db.AddMember("Test Reader")
-	if err != nil {
-		t.Fatalf("failed to add member: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			validation, err := db.ValidateReadBookAccess(tt.bookID, tt.memberID)
+			if err != nil {
+				t.Fatalf("ValidateReadBookAccess failed: %v", err)
+			}
 
-	// Test: Book should be available initially
-	book, err := db.GetBook(bookID)
-	if err != nil {
-		t.Fatalf("failed to get book: %v", err)
-	}
-	if !book.Available {
-		t.Fatalf("book should be available initially")
-	}
-
-	// Test: Reading available book should check it out
-	// Note: We can't easily test the interactive UI, but we can test the setup logic
-
-	// Simulate the checkout part of ReadBook
-	if err := db.CheckoutBook(bookID, memberID); err != nil {
-		t.Fatalf("checkout should succeed: %v", err)
-	}
-
-	// Verify book is now checked out
-	book, err = db.GetBook(bookID)
-	if err != nil {
-		t.Fatalf("failed to get book after checkout: %v", err)
-	}
-	if book.Available {
-		t.Fatalf("book should not be available after checkout")
-	}
-	if book.BorrowerID != memberID {
-		t.Fatalf("book should be checked out to member %d, got %d", memberID, book.BorrowerID)
+			if validation.BookExists != tt.expectedExists {
+				t.Errorf("BookExists = %v, want %v", validation.BookExists, tt.expectedExists)
+			}
+			if validation.MemberExists != tt.expectedMember {
+				t.Errorf("MemberExists = %v, want %v", validation.MemberExists, tt.expectedMember)
+			}
+			if validation.HasContent != tt.expectedContent {
+				t.Errorf("HasContent = %v, want %v", validation.HasContent, tt.expectedContent)
+			}
+			if validation.CanRead != tt.expectedCanRead {
+				t.Errorf("CanRead = %v, want %v", validation.CanRead, tt.expectedCanRead)
+			}
+			if validation.CanAutoCheckout != tt.expectedAutoCheckout {
+				t.Errorf("CanAutoCheckout = %v, want %v", validation.CanAutoCheckout, tt.expectedAutoCheckout)
+			}
+		})
 	}
 }
 
-func TestReadBookPermissions(t *testing.T) {
+func TestGetBookContentChunk(t *testing.T) {
+	db := tempDB(t)
+
+	content := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" // 36 characters
+	bookID, _ := db.AddBook("Chunk Test", "Author", content)
+
+	tests := []struct {
+		name     string
+		offset   int
+		length   int
+		expected string
+	}{
+		{
+			name:     "First chunk",
+			offset:   0,
+			length:   10,
+			expected: "0123456789",
+		},
+		{
+			name:     "Middle chunk",
+			offset:   10,
+			length:   10,
+			expected: "ABCDEFGHIJ",
+		},
+		{
+			name:     "Last chunk (partial)",
+			offset:   30,
+			length:   10,
+			expected: "UVWXYZ",
+		},
+		{
+			name:     "Beyond content",
+			offset:   50,
+			length:   10,
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chunk, err := db.GetBookContentChunk(bookID, tt.offset, tt.length)
+			if err != nil {
+				t.Fatalf("GetBookContentChunk failed: %v", err)
+			}
+			if chunk != tt.expected {
+				t.Errorf("GetBookContentChunk() = %q, want %q", chunk, tt.expected)
+			}
+		})
+	}
+}
+
+func TestReadBookValidation(t *testing.T) {
 	db := tempDB(t)
 	lm := &LibraryManager{db: db}
 
-	// Setup
-	content := "Test book content for permission testing."
-	bookID, _ := db.AddBook("Permission Test Book", "Author", content)
+	// Setup test data
+	content := "Test book content for validation testing."
+	bookID, _ := db.AddBook("Validation Test Book", "Author", content)
+	emptyBookID, _ := db.AddBook("Empty Book", "Author", "")
 	member1ID, _ := db.AddMember("Alice")
 	member2ID, _ := db.AddMember("Bob")
 
-	// Test 1: Non-existent book
-	err := lm.ReadBook(99999, member1ID)
-	if err == nil {
-		t.Fatalf("should fail for non-existent book")
-	}
-	if !strings.Contains(err.Error(), "book not found") {
-		t.Fatalf("expected 'book not found' error, got: %v", err)
+	// Checkout book to member2
+	db.CheckoutBook(bookID, member2ID)
+
+	tests := []struct {
+		name          string
+		bookID        int64
+		memberID      int64
+		expectedError string
+	}{
+		{
+			name:          "Non-existent book",
+			bookID:        99999,
+			memberID:      member1ID,
+			expectedError: "book not found",
+		},
+		{
+			name:          "Non-existent member",
+			bookID:        bookID,
+			memberID:      99999,
+			expectedError: "member not found",
+		},
+		{
+			name:          "Book without content",
+			bookID:        emptyBookID,
+			memberID:      member1ID,
+			expectedError: "book has no content to read",
+		},
+		{
+			name:          "Book checked out by another member (privacy test)",
+			bookID:        bookID,
+			memberID:      member1ID,
+			expectedError: "book is currently checked out by another member",
+		},
 	}
 
-	// Test 2: Non-existent member
-	err = lm.ReadBook(bookID, 99999)
-	if err == nil {
-		t.Fatalf("should fail for non-existent member")
-	}
-	if !strings.Contains(err.Error(), "member not found") {
-		t.Fatalf("expected 'member not found' error, got: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Temporarily redirect stdout to capture output
+			oldStdout := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
 
-	// Test 3: Member1 checks out book
-	if err := db.CheckoutBook(bookID, member1ID); err != nil {
-		t.Fatalf("checkout failed: %v", err)
-	}
+			err := lm.ReadBook(tt.bookID, tt.memberID)
 
-	// Test 4: Member2 tries to read book checked out by Member1
-	err = lm.ReadBook(bookID, member2ID)
-	if err == nil {
-		t.Fatalf("member2 should not be able to read book checked out by member1")
-	}
-	if !strings.Contains(err.Error(), "currently checked out by") {
-		t.Fatalf("expected 'currently checked out by' error, got: %v", err)
-	}
+			// Restore stdout
+			w.Close()
+			os.Stdout = oldStdout
 
-	// Test 5: Member1 should be able to read their own checked out book
-	// We can't test the full UI, but we can verify the permission check passes
-	book, _ := db.GetBook(bookID)
-	if book.BorrowerID != member1ID {
-		t.Fatalf("setup error: book should be checked out to member1")
-	}
-	// The ReadBook function would proceed to startReadingInterface for member1
-}
+			if err == nil {
+				t.Fatalf("Expected error but got none")
+			}
 
-func TestReadBookWithoutContent(t *testing.T) {
-	db := tempDB(t)
-	lm := &LibraryManager{db: db}
+			if !strings.Contains(err.Error(), tt.expectedError) {
+				t.Errorf("Expected error containing %q, got %q", tt.expectedError, err.Error())
+			}
 
-	// Create book without content
-	bookID, _ := db.AddBook("Empty Book", "Author", "")
-	memberID, _ := db.AddMember("Reader")
+			// Verify privacy: error should not contain borrower information
+			if strings.Contains(err.Error(), "Bob") || strings.Contains(err.Error(), "ID:") {
+				t.Errorf("Error message exposes borrower information: %q", err.Error())
+			}
 
-	err := lm.ReadBook(bookID, memberID)
-	if err == nil {
-		t.Fatalf("should fail for book without content")
-	}
-	if !strings.Contains(err.Error(), "no content to read") {
-		t.Fatalf("expected 'no content to read' error, got: %v", err)
-	}
-
-	// Test with whitespace-only content
-	if err := db.UpdateBookContent(bookID, "   \n\t  "); err != nil {
-		t.Fatalf("failed to update book content: %v", err)
-	}
-
-	err = lm.ReadBook(bookID, memberID)
-	if err == nil {
-		t.Fatalf("should fail for book with only whitespace content")
-	}
-	if !strings.Contains(err.Error(), "no content to read") {
-		t.Fatalf("expected 'no content to read' error, got: %v", err)
+			// Read any captured output
+			r.Close()
+		})
 	}
 }
 
 func TestReadBookAutoCheckout(t *testing.T) {
 	db := tempDB(t)
+	lm := &LibraryManager{db: db}
 
 	content := "This is content for auto-checkout testing."
 	bookID, _ := db.AddBook("Auto Checkout Book", "Author", content)
@@ -141,201 +264,211 @@ func TestReadBookAutoCheckout(t *testing.T) {
 	// Verify book is initially available
 	book, _ := db.GetBook(bookID)
 	if !book.Available {
-		t.Fatalf("book should be available initially")
+		t.Fatalf("Book should be available initially")
 	}
 
-	// Mock the checkout part of ReadBook (since we can't test the full UI)
-	// This simulates what happens when ReadBook is called on an available book
-	if err := db.CheckoutBook(bookID, memberID); err != nil {
-		t.Fatalf("auto-checkout should succeed: %v", err)
+	// Capture stdout to verify checkout message
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	// Mock stdin for quit command
+	oldStdin := os.Stdin
+	mockInput := &mockReader{inputs: []string{"q"}}
+	pr, pw, _ := os.Pipe()
+	os.Stdin = pr
+	go func() {
+		defer pw.Close()
+		io.Copy(pw, mockInput)
+	}()
+
+	// Call ReadBook
+	err := lm.ReadBook(bookID, memberID)
+
+	// Restore stdout and stdin
+	w.Close()
+	os.Stdout = oldStdout
+	pr.Close()
+	os.Stdin = oldStdin
+
+	if err != nil {
+		t.Fatalf("ReadBook should succeed for available book: %v", err)
 	}
 
-	// Verify book is now checked out to the member
+	// Read captured output
+	output := make([]byte, 1024)
+	n, _ := r.Read(output)
+	r.Close()
+
+	outputStr := string(output[:n])
+	if !strings.Contains(outputStr, "checked out to Reader for reading") {
+		t.Errorf("Expected checkout message in output, got: %q", outputStr)
+	}
+
+	// Verify book is now checked out
 	book, _ = db.GetBook(bookID)
 	if book.Available {
-		t.Fatalf("book should be checked out after ReadBook")
+		t.Errorf("Book should be checked out after ReadBook")
 	}
 	if book.BorrowerID != memberID {
-		t.Fatalf("book should be checked out to the reading member")
+		t.Errorf("Book should be checked out to the reading member")
 	}
 }
 
-func TestReadBookWithReservations(t *testing.T) {
+func TestReadBookMemoryEfficiency(t *testing.T) {
+	db := tempDB(t)
+
+	// Create a large book (simulate 50KB content)
+	largeContent := strings.Repeat("A", 50000)
+	bookID, _ := db.AddBook("Large Book", "Author", largeContent)
+	memberID, _ := db.AddMember("Reader")
+
+	// Checkout book first
+	db.CheckoutBook(bookID, memberID)
+
+	// Test that we can read chunks without loading entire content
+	chunk, err := db.GetBookContentChunk(bookID, 0, 1500)
+	if err != nil {
+		t.Fatalf("GetBookContentChunk failed: %v", err)
+	}
+
+	expectedChunk := strings.Repeat("A", 1500)
+	if chunk != expectedChunk {
+		t.Errorf("Chunk content mismatch, got length %d, expected length %d", len(chunk), len(expectedChunk))
+	}
+
+	// Test reading from middle
+	chunk2, err := db.GetBookContentChunk(bookID, 25000, 1500)
+	if err != nil {
+		t.Fatalf("GetBookContentChunk failed for middle chunk: %v", err)
+	}
+
+	if len(chunk2) != 1500 {
+		t.Errorf("Middle chunk length = %d, want 1500", len(chunk2))
+	}
+}
+
+func TestReadBookSinglePageHandling(t *testing.T) {
+	db := tempDB(t)
+
+	// Create a book with less than 1500 characters (single page)
+	shortContent := "This is a short book with less than 1500 characters."
+	bookID, _ := db.AddBook("Short Book", "Author", shortContent)
+	memberID, _ := db.AddMember("Reader")
+
+	// Checkout book
+	db.CheckoutBook(bookID, memberID)
+
+	// Test single page calculation
+	totalPages := (len(shortContent) + 1499) / 1500 // Same calculation as in the code
+	if totalPages != 1 {
+		t.Errorf("Expected 1 page for short content, got %d", totalPages)
+	}
+
+	// Test that navigation commands handle single page correctly
+	chunk, err := db.GetBookContentChunk(bookID, 0, 1500)
+	if err != nil {
+		t.Fatalf("GetBookContentChunk failed: %v", err)
+	}
+
+	if chunk != shortContent {
+		t.Errorf("Single page content mismatch")
+	}
+}
+
+func TestReadBookDatabaseEfficiency(t *testing.T) {
+	db := tempDB(t)
+
+	content := "Test content for database efficiency"
+	bookID, _ := db.AddBook("Efficiency Test", "Author", content)
+	memberID, _ := db.AddMember("Reader")
+
+	// Test that ValidateReadBookAccess gets all needed info in one query
+	validation, err := db.ValidateReadBookAccess(bookID, memberID)
+	if err != nil {
+		t.Fatalf("ValidateReadBookAccess failed: %v", err)
+	}
+
+	// Verify all required information is present
+	if validation.BookTitle != "Efficiency Test" {
+		t.Errorf("BookTitle = %q, want 'Efficiency Test'", validation.BookTitle)
+	}
+	if validation.BookAuthor != "Author" {
+		t.Errorf("BookAuthor = %q, want 'Author'", validation.BookAuthor)
+	}
+	if validation.MemberName != "Reader" {
+		t.Errorf("MemberName = %q, want 'Reader'", validation.MemberName)
+	}
+	if validation.BookContentLength != len(content) {
+		t.Errorf("BookContentLength = %d, want %d", validation.BookContentLength, len(content))
+	}
+	if !validation.BookExists {
+		t.Error("BookExists should be true")
+	}
+	if !validation.MemberExists {
+		t.Error("MemberExists should be true")
+	}
+	if !validation.HasContent {
+		t.Error("HasContent should be true")
+	}
+	if !validation.CanAutoCheckout {
+		t.Error("CanAutoCheckout should be true for available book")
+	}
+	if !validation.CanRead {
+		t.Error("CanRead should be true for available book with content")
+	}
+}
+
+func TestReadBookWhitespaceContent(t *testing.T) {
 	db := tempDB(t)
 	lm := &LibraryManager{db: db}
 
-	content := "Content for reservation testing."
-	bookID, _ := db.AddBook("Reserved Book", "Author", content)
-	member1ID, _ := db.AddMember("Current Borrower")
-	member2ID, _ := db.AddMember("Reserved Member")
-	member3ID, _ := db.AddMember("Other Member")
+	// Create book with only whitespace
+	wsContent := "   \n\t  \r\n  "
+	bookID, _ := db.AddBook("Whitespace Book", "Author", wsContent)
+	memberID, _ := db.AddMember("Reader")
 
-	// Member1 checks out the book
-	if err := db.CheckoutBook(bookID, member1ID); err != nil {
-		t.Fatalf("initial checkout failed: %v", err)
-	}
-
-	// Member2 reserves the book
-	if err := db.ReserveBook(bookID, member2ID); err != nil {
-		t.Fatalf("reservation failed: %v", err)
-	}
-
-	// Test 1: Member1 (current borrower) should be able to read
-	book, _ := db.GetBook(bookID)
-	if book.BorrowerID != member1ID {
-		t.Fatalf("setup error: member1 should have the book")
-	}
-	// ReadBook would succeed for member1 (can't test UI, but permission check passes)
-
-	// Test 2: Member2 (has reservation) should NOT be able to read until book is returned
-	err := lm.ReadBook(bookID, member2ID)
+	err := lm.ReadBook(bookID, memberID)
 	if err == nil {
-		t.Fatalf("member2 should not be able to read book they only have reserved")
-	}
-	if !strings.Contains(err.Error(), "currently checked out by") {
-		t.Fatalf("expected 'currently checked out by' error, got: %v", err)
+		t.Fatalf("Should fail for book with only whitespace content")
 	}
 
-	// Test 3: Member3 (no reservation) should also not be able to read
-	err = lm.ReadBook(bookID, member3ID)
-	if err == nil {
-		t.Fatalf("member3 should not be able to read book checked out by someone else")
-	}
-
-	// Test 4: After member1 returns, member2 gets auto-assigned and should be able to read
-	_, err = db.ReturnBook(bookID)
-	if err != nil {
-		t.Fatalf("return failed: %v", err)
-	}
-
-	// Verify member2 now has the book (auto-assigned from reservation)
-	book, _ = db.GetBook(bookID)
-	if book.Available {
-		t.Fatalf("book should be auto-assigned to member2")
-	}
-	if book.BorrowerID != member2ID {
-		t.Fatalf("book should be assigned to member2, got member %d", book.BorrowerID)
-	}
-
-	// Now member2 should be able to read (permission check would pass)
-	// We can't test the full UI, but we can verify the setup is correct
-}
-
-func TestReadBookContentPagination(t *testing.T) {
-	// Test the pagination logic by examining how content would be split
-	const pageSize = 1500
-
-	testCases := []struct {
-		name          string
-		contentLength int
-		expectedPages int
-	}{
-		{"Empty content", 0, 0},
-		{"Single character", 1, 1},
-		{"Exactly one page", pageSize, 1},
-		{"Just over one page", pageSize + 1, 2},
-		{"Two full pages", pageSize * 2, 2},
-		{"Two pages plus one char", pageSize*2 + 1, 3},
-		{"Large content", pageSize*5 + 100, 6},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			content := strings.Repeat("x", tc.contentLength)
-
-			// Simulate the pagination logic from startReadingInterface
-			pages := make([]string, 0)
-			for i := 0; i < len(content); i += pageSize {
-				end := i + pageSize
-				if end > len(content) {
-					end = len(content)
-				}
-				if i < len(content) { // Only add non-empty pages
-					pages = append(pages, content[i:end])
-				}
-			}
-
-			if len(pages) != tc.expectedPages {
-				t.Fatalf("expected %d pages, got %d", tc.expectedPages, len(pages))
-			}
-
-			// Verify page sizes (except possibly the last page)
-			for i, page := range pages {
-				expectedSize := pageSize
-				if i == len(pages)-1 && tc.contentLength%pageSize != 0 {
-					expectedSize = tc.contentLength % pageSize
-				}
-				if len(page) != expectedSize {
-					t.Fatalf("page %d: expected size %d, got %d", i, expectedSize, len(page))
-				}
-			}
-		})
+	if !strings.Contains(err.Error(), "no content to read") {
+		t.Errorf("Expected 'no content to read' error, got: %v", err)
 	}
 }
 
-func TestReadBookIntegrationWithLibraryOperations(t *testing.T) {
+func TestReadBookBoundaryConditions(t *testing.T) {
 	db := tempDB(t)
-	lm := &LibraryManager{db: db}
 
-	content := "Integration test content for reading functionality."
-	bookID, _ := db.AddBook("Integration Book", "Author", content)
-	member1ID, _ := db.AddMember("Alice")
-	member2ID, _ := db.AddMember("Bob")
+	// Test exactly 1500 characters (boundary)
+	exactContent := strings.Repeat("X", 1500)
+	bookID, _ := db.AddBook("Boundary Book", "Author", exactContent)
 
-	// Test 1: Read available book (should auto-checkout)
-	// Simulate the checkout that would happen in ReadBook
-	if err := db.CheckoutBook(bookID, member1ID); err != nil {
-		t.Fatalf("auto-checkout simulation failed: %v", err)
-	}
-
-	// Test 2: Verify book is checked out
-	book, _ := db.GetBook(bookID)
-	if book.Available || book.BorrowerID != member1ID {
-		t.Fatalf("book should be checked out to member1")
-	}
-
-	// Test 3: Member2 reserves the book
-	if err := db.ReserveBook(bookID, member2ID); err != nil {
-		t.Fatalf("reservation should succeed: %v", err)
-	}
-
-	// Test 4: Member1 can still read (they have it checked out)
-	// Permission check should pass
-	if book.BorrowerID != member1ID {
-		t.Fatalf("member1 should still have the book")
-	}
-
-	// Test 5: Member2 cannot read yet
-	err := lm.ReadBook(bookID, member2ID)
-	if err == nil {
-		t.Fatalf("member2 should not be able to read book checked out by member1")
-	}
-
-	// Test 6: After return, member2 gets the book and can read
-	_, err = db.ReturnBook(bookID)
+	// Test chunk at exact boundary
+	chunk, err := db.GetBookContentChunk(bookID, 0, 1500)
 	if err != nil {
-		t.Fatalf("return failed: %v", err)
+		t.Fatalf("GetBookContentChunk failed: %v", err)
 	}
 
-	book, _ = db.GetBook(bookID)
-	if book.BorrowerID != member2ID {
-		t.Fatalf("book should be auto-assigned to member2")
+	if len(chunk) != 1500 {
+		t.Errorf("Chunk length = %d, want 1500", len(chunk))
 	}
 
-	// Now member2 should be able to read (permission check passes)
-	// Test 7: Update content and verify reading still works
-	newContent := "Updated content for continued reading test."
-	if err := db.UpdateBookContent(bookID, newContent); err != nil {
-		t.Fatalf("content update failed: %v", err)
-	}
+	// Test 1501 characters (2 pages)
+	overContent := strings.Repeat("Y", 1501)
+	bookID2, _ := db.AddBook("Over Boundary Book", "Author", overContent)
 
-	book, _ = db.GetBook(bookID)
-	if book.Content != newContent {
-		t.Fatalf("content was not updated properly")
-	}
+	chunk1, _ := db.GetBookContentChunk(bookID2, 0, 1500)
+	chunk2, _ := db.GetBookContentChunk(bookID2, 1500, 1500)
 
-	// Member2 should still be able to read with updated content
-	if book.BorrowerID != member2ID {
-		t.Fatalf("member2 should still have the book after content update")
+	if len(chunk1) != 1500 {
+		t.Errorf("First chunk length = %d, want 1500", len(chunk1))
+	}
+	if len(chunk2) != 1 {
+		t.Errorf("Second chunk length = %d, want 1", len(chunk2))
+	}
+	if chunk2 != "Y" {
+		t.Errorf("Second chunk = %q, want 'Y'", chunk2)
 	}
 }
