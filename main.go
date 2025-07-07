@@ -24,7 +24,7 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	fmt.Println("Welcome to the Library Management System (SQLite edition)!")
-	fmt.Println("Available commands: add book, add member, list books, list members, search book, advanced search, checkout, return, reserve, list reservations, cancel reservation, update content, exit")
+	fmt.Println("Available commands: add book, add member, list books, list members, search book, advanced search, checkout, return, reserve, list reservations, cancel reservation, update content, read book, exit")
 
 	for {
 		fmt.Print("\n> ")
@@ -56,6 +56,8 @@ func main() {
 			handleCancelReservation(scanner, manager)
 		case "update content":
 			handleUpdateContent(scanner, manager)
+		case "read book":
+			handleReadBook(scanner, manager)
 		case "exit":
 			fmt.Println("Goodbye!")
 			return
@@ -419,6 +421,34 @@ func handleUpdateContent(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		fmt.Printf("Error: %v\n", err)
 	} else {
 		fmt.Println("Content updated.")
+	}
+}
+
+func handleReadBook(sc *bufio.Scanner, mgr *library.LibraryManager) {
+	fmt.Print("Book ID: ")
+	if !sc.Scan() {
+		return
+	}
+	bookIDStr := strings.TrimSpace(sc.Text())
+	bookID, err := strconv.ParseInt(bookIDStr, 10, 64)
+	if err != nil {
+		fmt.Println("Invalid book ID.")
+		return
+	}
+
+	fmt.Print("Member ID: ")
+	if !sc.Scan() {
+		return
+	}
+	memberIDStr := strings.TrimSpace(sc.Text())
+	memberID, err := strconv.ParseInt(memberIDStr, 10, 64)
+	if err != nil {
+		fmt.Println("Invalid member ID.")
+		return
+	}
+
+	if err := mgr.ReadBook(bookID, memberID); err != nil {
+		fmt.Printf("Error: %v\n", err)
 	}
 }
 
