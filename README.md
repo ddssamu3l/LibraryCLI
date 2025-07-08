@@ -1,5 +1,8 @@
 # Library Management CLI
 
+![LibraryCLIDemo-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/2f52bda0-4938-420f-b15f-171a9f343e17)
+
+
 ## Setup
 
 1. **Download and Extract**
