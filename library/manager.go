@@ -183,8 +183,7 @@ func (lm *LibraryManager) UpdateBookContentFromFile(id int64, path string) error
 }
 
 // ReadBook allows a member to read a book with pagination and proper authorization
-// If the book is available, it checks it out first.
-// If the book is checked out, only allows reading if it's checked out by the same member.
+// Only allows reading if the book is already checked out to the member.
 func (lm *LibraryManager) ReadBook(bookID, memberID int64) error {
 	// Single optimized query for all validation
 	validation, err := lm.db.ValidateReadBookAccess(bookID, memberID)
@@ -218,15 +217,14 @@ func (lm *LibraryManager) ReadBook(bookID, memberID int64) error {
 		}
 	}
 
-	// Handle auto-checkout
-	if validation.CanAutoCheckout {
-		if err := lm.db.CheckoutBook(bookID, memberID); err != nil {
-			return fmt.Errorf("failed to check out book: %w", err)
+	// Check if member can read the book (must already have it checked out)
+	if !validation.CanRead {
+		if validation.BookAvailable {
+			return fmt.Errorf("book is available but not checked out to you. Please check out the book first to read it")
+		} else {
+			// Book is checked out by someone else - don't expose borrower information
+			return fmt.Errorf("book is currently checked out by another member")
 		}
-		fmt.Printf("Book '%s' checked out to %s for reading.\n", validation.BookTitle, validation.MemberName)
-	} else if !validation.CanRead {
-		// Book is checked out by someone else - don't expose borrower information
-		return fmt.Errorf("book is currently checked out by another member")
 	}
 
 	// Start the reading interface with efficient pagination
@@ -340,7 +338,7 @@ func (lm *LibraryManager) startReadingInterface(bookID int64, title, author, mem
 				fmt.Print("\033[2J\033[H")
 			}
 		case "q", "quit", "exit":
-			fmt.Printf("📖 Finished reading '%s'. The book remains checked out to you.\n", title)
+			fmt.Printf("📖 Finished reading '%s'.\n", title)
 			return nil
 		case "":
 			// Just refresh the display
