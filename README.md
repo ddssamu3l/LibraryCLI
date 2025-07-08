@@ -1,62 +1,125 @@
-# Model Comparison Project
+# Library Management CLI
 
-**Project Date:** 2025-07-02 20:11:00
+## Setup
 
-This project contains model comparison results.
+1. **Download and Extract**
+   ```bash
+   # Extract the project zip file to your desired location
+   cd LibraryCLI
+   ```
 
-- `preedit` branch: Original baseline codebase
-- `beetle` branch: Beetle model's response
-- `sonnet` branch: Sonnet model's response
-- `rewrite` branch: Rewritten codebase
+2. **Install Dependencies**
+   ```bash
+   go mod tidy
+   ```
 
-## Library Management CLI (SQLite Rewrite)
+3. **Initialize Database** (First time setup)
+   ```bash
+   # Import sample books from the texts/ directory
+   go run import_books.go
+   ```
 
-This branch stores **all data**—books, members, checkout history, and full-text search index—in a single on-disk SQLite database (`library.db`).  The design scales to millions of books with megabytes of text each by using:
+## Running the Application
 
-* FTS5 virtual table (`books_fts`) for instant full-text search of title, author, and content.
-* A separate `checkouts` table to keep historical records while the `books` row tracks current availability.
-* WAL mode + prepared statements + transactions for high-throughput batch inserts.
+Start the interactive CLI:
+```bash
+go run -tags sqlite_fts5 .
+```
 
-## Requirements
+The application will display a welcome message and prompt for commands. Type `help` to see available commands.
 
-1. Go 1.20+
-2. CGO enabled (default on macOS/Linux).  On Windows make sure you have gcc installed (e.g. via **mingw-w64**).
-3. Build tag `sqlite_fts5` to compile the native driver with FTS5 support.
+## Testing
+
+Run the comprehensive test suite:
+```bash
+go test -tags sqlite_fts5 ./library
+```
+
+The tests cover:
+- Authentication and password security
+- Book operations and reservations
+- Database migrations and schema
+- Edge cases and error handling
+
+## Database Management
+
+### Reset to Clean State
+
+To restore the database to a clean state with sample books but no members or reservations:
 
 ```bash
-# install deps
-go mod tidy
+./restore_base_db.sh
+```
 
-# run the CLI
+This will:
+- Remove current database files
+- Restore a clean database with 16 pre-loaded books
+- Reset all member accounts and reservations
+
+### Manual Database Reset
+
+If the restore script doesn't work:
+```bash
+# Remove current database
+rm -f library.db library.db-shm library.db-wal
+
+# Copy base database
+cp base_db/library.db .
+```
+
+### Complete Fresh Start
+
+To start completely from scratch:
+```bash
+# Remove all database files
+rm -f library.db library.db-shm library.db-wal
+
+# Re-import books
+go run import_books.go
+```
+
+## Sample Books Included
+
+The system comes with 16 classic books pre-loaded:
+- Literature: 1984, Animal Farm, Romeo & Juliet, Three Musketeers
+- Fantasy: Lord of the Rings trilogy, Harry Potter series
+- Historical: Anne Frank's Diary, Art of War
+- Children's: Three Little Pigs
+
+## Troubleshooting
+
+### Build Issues
+If you encounter build errors:
+```bash
+# Make sure you're using the sqlite_fts5 build tag
 go run -tags sqlite_fts5 .
 
-# run tests
-go test ./... -tags sqlite_fts5
+# Clean and rebuild
+go clean
+go mod tidy
 ```
 
-## CLI Usage
+### Database Issues
+If the database becomes corrupted:
+```bash
+# Reset to clean state
+./restore_base_db.sh
 
-| Command          | Description |
-|------------------|-------------|
-| `add book`       | Prompts for title, author, then optional file path to stream full text. |
-| `add member`     | Registers a library member. |
-| `update content` | Attach or replace the book's text later by providing book ID and file path. |
-| `list books`     | Lists all books without loading their heavy text columns. |
-| `list members`   | Lists members. |
-| `search book`    | Full-text search across title, author, and book text. |
-| `checkout`       | Checkout a book (updates `books`, inserts into `checkouts`). |
-| `return`         | Return a book (records `return_time` in `checkouts`). |
-| `exit`           | Quit. |
-
-## Internals
-
-```
-books(id PK, title, author, content, available, borrower_id FK)  <-- current state
-members(id PK, name)
-checkouts(id PK, book_id FK, member_id FK, checkout_time, return_time)
-books_fts(title, author, content)             <-- FTS5 virtual table
+# Or start fresh
+rm -f library.db*
+go run import_books.go
 ```
 
-Triggers keep `books_fts` in sync with the `books` table, and WAL mode improves concurrency. Large-scale bulk imports should wrap many `AddBookFromFile` calls in one transaction; the driver, prepared statement, and buffered file streaming keep memory usage bounded (only one book's text in RAM at a time).
+### Permission Issues
+If you can't execute the restore script:
+```bash
+chmod +x restore_base_db.sh
+```
 
-Happy reading! 😄
+## Architecture
+
+- **Main**: Interactive CLI interface (`main.go`)
+- **Manager**: Business logic layer (`library/manager.go`)
+- **Database**: SQLite operations with FTS5 (`library/database.go`)
+- **Models**: Data structures (`library/models.go`)
+- **Tests**: Comprehensive test suite (`library/database_test.go`)

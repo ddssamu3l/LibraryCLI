@@ -58,6 +58,9 @@ func main() {
 	fmt.Println("  Circulation: checkout, return, reserve, list reservations, cancel reservation")
 	fmt.Println("  Reading: read book")
 	fmt.Println("  System: exit")
+	fmt.Println()
+	fmt.Println("Tips:")
+	fmt.Println("  • For 'list reservations': Enter a Book ID for specific book, or press Enter to see all books")
 
 	for {
 		fmt.Print("\n> ")
@@ -474,11 +477,18 @@ func handleReserve(sc *bufio.Scanner, mgr *library.LibraryManager) {
 }
 
 func handleListReservations(sc *bufio.Scanner, mgr *library.LibraryManager) {
-	fmt.Print("Book ID: ")
+	fmt.Print("Book ID (or press Enter for all books): ")
 	if !sc.Scan() {
 		return
 	}
 	bookIDStr := strings.TrimSpace(sc.Text())
+
+	// If no Book ID provided, show reservations for all books
+	if bookIDStr == "" {
+		handleListAllReservations(mgr)
+		return
+	}
+
 	bookID, err := strconv.ParseInt(bookIDStr, 10, 64)
 	if err != nil {
 		fmt.Printf("Invalid book ID: %s\n", bookIDStr)
@@ -509,6 +519,76 @@ func handleListReservations(sc *bufio.Scanner, mgr *library.LibraryManager) {
 
 	for i, member := range reservations {
 		fmt.Printf("%-10d %-5d %-30s\n", i+1, member.ID, member.Name)
+	}
+}
+
+func handleListAllReservations(mgr *library.LibraryManager) {
+	books, err := mgr.GetAllBooks()
+	if err != nil {
+		fmt.Printf("Error retrieving books: %v\n", err)
+		return
+	}
+
+	if len(books) == 0 {
+		fmt.Println("No books in the library.")
+		return
+	}
+
+	fmt.Println("Reservation Status for All Books:")
+	fmt.Printf("%-5s %-30s %-25s %-12s %-30s %s\n", "ID", "Title", "Author", "Status", "Current Borrower", "Reservations")
+	fmt.Println(strings.Repeat("-", 130))
+
+	hasAnyReservations := false
+
+	for _, book := range books {
+		// Get current borrower info
+		var statusInfo, borrowerInfo string
+		if book.Available {
+			statusInfo = "Available"
+			borrowerInfo = "None"
+		} else {
+			statusInfo = "Checked Out"
+			if member, err := mgr.GetMember(book.BorrowerID); err == nil {
+				borrowerInfo = fmt.Sprintf("%s (ID: %d)", member.Name, member.ID)
+			} else {
+				borrowerInfo = fmt.Sprintf("ID: %d", book.BorrowerID)
+			}
+		}
+
+		// Get reservations for this book
+		reservations, err := mgr.GetReservations(book.ID)
+		var reservationInfo string
+		if err != nil || len(reservations) == 0 {
+			reservationInfo = "None"
+		} else {
+			hasAnyReservations = true
+			var queueList []string
+			for i, member := range reservations {
+				queueList = append(queueList, fmt.Sprintf("%d.%s(ID:%d)", i+1, member.Name, member.ID))
+			}
+			reservationInfo = strings.Join(queueList, ", ")
+		}
+
+		fmt.Printf("%-5d %-30s %-25s %-12s %-30s %s\n",
+			book.ID,
+			truncateString(book.Title, 30),
+			truncateString(book.Author, 25),
+			statusInfo,
+			truncateString(borrowerInfo, 30),
+			reservationInfo)
+	}
+
+	if !hasAnyReservations {
+		fmt.Println("\nNo active reservations in the system.")
+	} else {
+		fmt.Printf("\nTotal books: %d | Books with reservations: ", len(books))
+		reservedCount := 0
+		for _, book := range books {
+			if reservations, err := mgr.GetReservations(book.ID); err == nil && len(reservations) > 0 {
+				reservedCount++
+			}
+		}
+		fmt.Printf("%d\n", reservedCount)
 	}
 }
 

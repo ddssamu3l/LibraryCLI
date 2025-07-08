@@ -48,8 +48,8 @@ func main() {
 		"three_musketeers.txt":                {"The Three Musketeers", "Alexandre Dumas"},
 	}
 
-	// Import books from the books directory
-	booksDir := "books"
+	// Import books from the texts directory
+	booksDir := "texts"
 	fmt.Printf("Importing books from %s directory...\n", booksDir)
 
 	files, err := os.ReadDir(booksDir)
