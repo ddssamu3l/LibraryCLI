@@ -49,18 +49,22 @@ func (lm *LibraryManager) UpdateBookContent(id int64, content string) error {
 func (lm *LibraryManager) GetBook(id int64) (*Book, error) { return lm.db.GetBook(id) }
 func (lm *LibraryManager) GetAllBooks() ([]*Book, error)   { return lm.db.GetAllBooks() }
 
-// ------------------ Member helpers (updated) ------------------
+// ------------------ Member helpers with Authentication ------------------
 
+// AddMember creates a new member with password validation
 func (lm *LibraryManager) AddMember(name, password string) (int64, error) {
 	return lm.db.AddMember(name, password)
 }
+
 func (lm *LibraryManager) GetMember(id int64) (*Member, error) { return lm.db.GetMember(id) }
 func (lm *LibraryManager) GetAllMembers() ([]*Member, error)   { return lm.db.GetAllMembers() }
 
+// AuthenticateMember verifies member credentials
 func (lm *LibraryManager) AuthenticateMember(memberID int64, password string) error {
 	return lm.db.AuthenticateMember(memberID, password)
 }
 
+// ResetMemberPassword updates a member's password with validation
 func (lm *LibraryManager) ResetMemberPassword(memberID int64, newPassword string) error {
 	return lm.db.ResetMemberPassword(memberID, newPassword)
 }
@@ -89,19 +93,30 @@ func (lm *LibraryManager) SearchBooks(q string) ([]*Book, error) {
 	return lm.db.SearchBooks(q)
 }
 
-// ------------------ Circulation ------------------
+// ------------------ Circulation with Authorization ------------------
 
+// CheckoutBook performs a book checkout
 func (lm *LibraryManager) CheckoutBook(bookID, memberID int64) error {
 	return lm.db.CheckoutBook(bookID, memberID)
 }
 
-// ReturnBook returns the book and yields the member who had it.
-func (lm *LibraryManager) ReturnBook(bookID int64) (int64, error) {
+// ReturnBook returns the book and yields the member who had it with authorization check
+func (lm *LibraryManager) ReturnBook(bookID, memberID int64) (int64, error) {
+	// First verify the member is authorized to return this book
+	if err := lm.db.VerifyReturnAuthorization(bookID, memberID); err != nil {
+		return 0, err
+	}
+
 	return lm.db.ReturnBook(bookID)
 }
 
-// ReturnBookWithDetails returns the book and provides detailed information about what happened.
-func (lm *LibraryManager) ReturnBookWithDetails(bookID int64) (returnedByMemberID int64, assignedToMemberID int64, err error) {
+// ReturnBookWithDetails returns the book and provides detailed information about what happened
+func (lm *LibraryManager) ReturnBookWithDetails(bookID, memberID int64) (returnedByMemberID int64, assignedToMemberID int64, err error) {
+	// First verify the member is authorized to return this book
+	if err := lm.db.VerifyReturnAuthorization(bookID, memberID); err != nil {
+		return 0, 0, err
+	}
+
 	// First get the current borrower
 	book, err := lm.db.GetBook(bookID)
 	if err != nil {
@@ -167,7 +182,7 @@ func (lm *LibraryManager) UpdateBookContentFromFile(id int64, path string) error
 	return lm.db.UpdateBookContent(id, sb.String())
 }
 
-// ReadBook allows a member to read a book with pagination.
+// ReadBook allows a member to read a book with pagination and proper authorization
 // If the book is available, it checks it out first.
 // If the book is checked out, only allows reading if it's checked out by the same member.
 func (lm *LibraryManager) ReadBook(bookID, memberID int64) error {
@@ -177,7 +192,7 @@ func (lm *LibraryManager) ReadBook(bookID, memberID int64) error {
 		return fmt.Errorf("database error: %w", err)
 	}
 
-	// Check validation results
+	// Check validation results with improved error messages
 	if !validation.BookExists {
 		return fmt.Errorf("book not found")
 	}
@@ -219,7 +234,7 @@ func (lm *LibraryManager) ReadBook(bookID, memberID int64) error {
 		validation.MemberName, validation.BookContentLength)
 }
 
-// startReadingInterface provides a paginated reading experience with lazy loading.
+// startReadingInterface provides a paginated reading experience with lazy loading
 func (lm *LibraryManager) startReadingInterface(bookID int64, title, author, memberName string, totalLength int) error {
 	const pageSize = 1500
 
@@ -255,30 +270,19 @@ func (lm *LibraryManager) startReadingInterface(bookID int64, title, author, mem
 		// Display navigation footer (only show navigation for multi-page books)
 		fmt.Printf("\n═══════════════════════════════════════════════════════════════════════════════\n")
 		if totalPages == 1 {
-			fmt.Printf("Navigation: [q]uit\n")
+			fmt.Printf("📖 End of book. Press [q] to quit.")
 		} else {
-			fmt.Printf("Navigation: [n]ext | [p]revious | [g]oto page | [q]uit\n")
-			if currentPage > 0 {
-				fmt.Printf("← Previous")
-			}
-			if currentPage < totalPages-1 {
-				if currentPage > 0 {
-					fmt.Printf(" | ")
-				}
-				fmt.Printf("Next →")
-			}
+			fmt.Printf("📖 Navigation: [n]ext | [p]revious | [g]oto page | [q]uit")
 		}
-		fmt.Printf("\n> ")
+		fmt.Printf("\n═══════════════════════════════════════════════════════════════════════════════\n")
+		fmt.Print("Command: ")
 
-		// Get user input
 		if !scanner.Scan() {
-			break
+			break // EOF or error
 		}
 
 		input := strings.ToLower(strings.TrimSpace(scanner.Text()))
-
-		// Clear screen for next display
-		fmt.Print("\033[2J\033[H")
+		fmt.Print("\033[2J\033[H") // Clear screen
 
 		switch input {
 		case "n", "next":

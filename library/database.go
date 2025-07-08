@@ -63,184 +63,291 @@ func (d *Database) Close() error {
 }
 
 // ---------------------------------------------------------------------------
-// Schema migration
+// Schema migration with proper password support
 // ---------------------------------------------------------------------------
 
 const schemaVersion = 3
 
 func applyMigrations(db *sql.DB) error {
-	// WAL improves write concurrency.
-	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-		return fmt.Errorf("enable WAL: %w", err)
+	// Create schema_version table if it doesn't exist
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER)`); err != nil {
+		return fmt.Errorf("create schema_version table: %w", err)
 	}
 
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);`); err != nil {
-		return err
+	// Get current version
+	var currentVersion int
+	err := db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&currentVersion)
+	if err == sql.ErrNoRows {
+		currentVersion = 0
+	} else if err != nil {
+		return fmt.Errorf("get schema version: %w", err)
 	}
 
-	var current int
-	_ = db.QueryRow(`SELECT value FROM meta WHERE key='schema_version';`).Scan(&current)
-	if current >= schemaVersion {
-		return nil
+	// Apply migrations in sequence
+	if currentVersion < 1 {
+		if err := applyMigration1(db); err != nil {
+			return err
+		}
 	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
+	if currentVersion < 2 {
+		if err := applyMigration2(db); err != nil {
+			return err
+		}
 	}
-	defer tx.Rollback()
-
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            password_hash TEXT NOT NULL DEFAULT ''
-        );`,
-		`CREATE TABLE IF NOT EXISTS books (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            author TEXT NOT NULL,
-            content TEXT NOT NULL,
-            available BOOLEAN NOT NULL DEFAULT 1,
-            borrower_id INTEGER REFERENCES members(id)
-        );`,
-		`CREATE TABLE IF NOT EXISTS checkouts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            book_id INTEGER NOT NULL REFERENCES books(id),
-            member_id INTEGER NOT NULL REFERENCES members(id),
-            checkout_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            return_time DATETIME
-        );`,
-		`CREATE TABLE IF NOT EXISTS reservations (
-		    id INTEGER PRIMARY KEY AUTOINCREMENT,
-		    book_id INTEGER NOT NULL REFERENCES books(id),
-		    member_id INTEGER NOT NULL REFERENCES members(id),
-		    reservation_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		    fulfilled_time DATETIME,
-		    UNIQUE(book_id, member_id)
-		);`,
-		// FTS5 virtual table
-		`CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
-            title, author, content, content='books', content_rowid='id'
-        );`,
-		// Triggers to keep FTS in sync
-		`CREATE TRIGGER IF NOT EXISTS trg_books_ai AFTER INSERT ON books BEGIN
-            INSERT INTO books_fts(rowid,title,author,content) VALUES(new.id,new.title,new.author,new.content);
-        END;`,
-		`CREATE TRIGGER IF NOT EXISTS trg_books_ad AFTER DELETE ON books BEGIN
-            INSERT INTO books_fts(books_fts, rowid, title, author, content) VALUES('delete',old.id,old.title,old.author,old.content);
-        END;`,
-		`CREATE TRIGGER IF NOT EXISTS trg_books_au AFTER UPDATE ON books BEGIN
-            INSERT INTO books_fts(books_fts, rowid, title, author, content) VALUES('delete',old.id,old.title,old.author,old.content);
-            INSERT INTO books_fts(rowid,title,author,content) VALUES(new.id,new.title,new.author,new.content);
-        END;`,
-		// Migration for existing members without passwords
-		`UPDATE members SET password_hash = '' WHERE password_hash IS NULL;`,
-		`INSERT INTO meta(key,value) VALUES('schema_version',?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value;`,
-	}
-
-	for _, stmt := range stmts {
-		if _, err := tx.Exec(stmt, schemaVersion); err != nil {
-			return fmt.Errorf("apply migration: %w", err)
+	if currentVersion < 3 {
+		if err := applyMigration3(db); err != nil {
+			return err
 		}
 	}
 
-	return tx.Commit()
+	// Update version
+	if currentVersion == 0 {
+		if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, schemaVersion); err != nil {
+			return fmt.Errorf("insert schema version: %w", err)
+		}
+	} else {
+		if _, err := db.Exec(`UPDATE schema_version SET version = ?`, schemaVersion); err != nil {
+			return fmt.Errorf("update schema version: %w", err)
+		}
+	}
+
+	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Prepared statements
-// ---------------------------------------------------------------------------
+func applyMigration1(db *sql.DB) error {
+	// Initial schema
+	schema := `
+		CREATE TABLE IF NOT EXISTS books (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			title TEXT NOT NULL,
+			author TEXT NOT NULL,
+			content TEXT DEFAULT '',
+			available BOOLEAN DEFAULT 1,
+			borrower_id INTEGER,
+			FOREIGN KEY (borrower_id) REFERENCES members(id)
+		);
+
+		CREATE TABLE IF NOT EXISTS members (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE
+		);
+
+		CREATE TABLE IF NOT EXISTS checkouts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			book_id INTEGER NOT NULL,
+			member_id INTEGER NOT NULL,
+			checkout_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+			return_time DATETIME,
+			FOREIGN KEY (book_id) REFERENCES books(id),
+			FOREIGN KEY (member_id) REFERENCES members(id)
+		);
+
+		CREATE TABLE IF NOT EXISTS reservations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			book_id INTEGER NOT NULL,
+			member_id INTEGER NOT NULL,
+			reservation_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+			fulfilled_time DATETIME,
+			FOREIGN KEY (book_id) REFERENCES books(id),
+			FOREIGN KEY (member_id) REFERENCES members(id)
+		);
+	`
+	if _, err := db.Exec(schema); err != nil {
+		return fmt.Errorf("apply migration 1: %w", err)
+	}
+	return nil
+}
+
+func applyMigration2(db *sql.DB) error {
+	// Add FTS5 support
+	ftsSchema := `
+		CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
+			title, author, content, content_id UNINDEXED
+		);
+
+		-- Populate FTS table with existing data
+		INSERT OR IGNORE INTO books_fts(title, author, content, content_id)
+		SELECT title, author, content, id FROM books;
+
+		-- Trigger to keep FTS in sync
+		CREATE TRIGGER IF NOT EXISTS books_fts_insert AFTER INSERT ON books BEGIN
+			INSERT INTO books_fts(title, author, content, content_id) VALUES (new.title, new.author, new.content, new.id);
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS books_fts_update AFTER UPDATE ON books BEGIN
+			UPDATE books_fts SET title = new.title, author = new.author, content = new.content WHERE content_id = new.id;
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS books_fts_delete AFTER DELETE ON books BEGIN
+			DELETE FROM books_fts WHERE content_id = old.id;
+		END;
+	`
+	if _, err := db.Exec(ftsSchema); err != nil {
+		return fmt.Errorf("apply migration 2: %w", err)
+	}
+	return nil
+}
+
+func applyMigration3(db *sql.DB) error {
+	// Add password authentication support with backwards compatibility
+	passwordSchema := `
+		-- Add password_hash column with backwards compatibility
+		ALTER TABLE members ADD COLUMN password_hash TEXT DEFAULT NULL;
+	`
+	if _, err := db.Exec(passwordSchema); err != nil {
+		return fmt.Errorf("apply migration 3: %w", err)
+	}
+	return nil
+}
 
 func (d *Database) prepareStatements() error {
 	var err error
-	if d.addBookStmt, err = d.db.Prepare(`INSERT INTO books(title,author,content) VALUES(?,?,?)`); err != nil {
-		return err
+	d.addBookStmt, err = d.db.Prepare(`INSERT INTO books(title, author, content) VALUES(?,?,?)`)
+	if err != nil {
+		return fmt.Errorf("prepare addBookStmt: %w", err)
 	}
-	if d.addMemberStmt, err = d.db.Prepare(`INSERT INTO members(name,password_hash) VALUES(?,?)`); err != nil {
-		return err
+	d.addMemberStmt, err = d.db.Prepare(`INSERT INTO members(name, password_hash) VALUES(?,?)`)
+	if err != nil {
+		return fmt.Errorf("prepare addMemberStmt: %w", err)
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Authentication helpers
+// Secure Password Management
 // ---------------------------------------------------------------------------
 
-// HashPassword creates a bcrypt hash of the password
+const (
+	bcryptCost        = 12 // Higher cost for better security
+	maxPasswordLength = 72 // bcrypt limit
+	minPasswordLength = 1  // Minimum length (can't be empty)
+)
+
+// HashPassword securely hashes a password using bcrypt with proper validation
 func (d *Database) HashPassword(password string) (string, error) {
-	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	return string(bytes), err
+	// Validate password length and content
+	if strings.TrimSpace(password) == "" {
+		return "", fmt.Errorf("password cannot be empty")
+	}
+
+	if len(password) < minPasswordLength {
+		return "", fmt.Errorf("password must be at least %d character long", minPasswordLength)
+	}
+
+	if len(password) > maxPasswordLength {
+		return "", fmt.Errorf("password too long (maximum %d characters)", maxPasswordLength)
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash password: %w", err)
+	}
+	return string(hash), nil
 }
 
-// CheckPassword verifies a password against its hash
+// CheckPassword verifies a password against its hash using constant-time comparison
 func (d *Database) CheckPassword(password, hash string) bool {
 	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 	return err == nil
 }
 
-// AuthenticateMember verifies member credentials
+// AuthenticateMember verifies member credentials and provides secure error messages
 func (d *Database) AuthenticateMember(memberID int64, password string) error {
-	var hash string
-	err := d.db.QueryRow(`SELECT password_hash FROM members WHERE id=?`, memberID).Scan(&hash)
+	var storedHash sql.NullString
+	var memberName string
+
+	err := d.db.QueryRow(`SELECT name, password_hash FROM members WHERE id = ?`, memberID).
+		Scan(&memberName, &storedHash)
+
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("member not found")
+		// Generic error message - don't reveal if member exists
+		return fmt.Errorf("authentication failed: invalid member ID or password")
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("database error during authentication: %w", err)
 	}
 
-	if hash == "" {
-		return fmt.Errorf("member has no password set - please contact administrator")
+	// Handle legacy members without passwords (backwards compatibility)
+	if !storedHash.Valid || storedHash.String == "" {
+		return fmt.Errorf("member %s has not set up a password yet. Please contact administrator", memberName)
 	}
 
-	if !d.CheckPassword(password, hash) {
-		return fmt.Errorf("invalid password")
+	// Verify password using constant-time comparison
+	if !d.CheckPassword(password, storedHash.String) {
+		// Generic error message - don't reveal which part failed
+		return fmt.Errorf("authentication failed: invalid member ID or password")
 	}
 
 	return nil
 }
 
-// ResetMemberPassword updates a member's password
+// ResetMemberPassword securely updates a member's password with proper validation
 func (d *Database) ResetMemberPassword(memberID int64, newPassword string) error {
-	hash, err := d.HashPassword(newPassword)
+	// Validate new password
+	newHash, err := d.HashPassword(newPassword)
 	if err != nil {
-		return fmt.Errorf("failed to hash password: %w", err)
+		return fmt.Errorf("invalid password: %w", err)
 	}
 
-	result, err := d.db.Exec(`UPDATE members SET password_hash=? WHERE id=?`, hash, memberID)
+	// Check if member exists
+	var memberName string
+	err = d.db.QueryRow(`SELECT name FROM members WHERE id = ?`, memberID).Scan(&memberName)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("member with ID %d not found", memberID)
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("database error: %w", err)
 	}
 
-	rows, err := result.RowsAffected()
+	// Update password
+	result, err := d.db.Exec(`UPDATE members SET password_hash = ? WHERE id = ?`, newHash, memberID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to update password: %w", err)
 	}
-	if rows == 0 {
-		return fmt.Errorf("member not found")
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to verify password update: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("member with ID %d not found", memberID)
 	}
 
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// CRUD helpers (updated)
+// Member Management with Authentication
 // ---------------------------------------------------------------------------
 
+// AddMember creates a new member with proper password validation
 func (d *Database) AddMember(name, password string) (int64, error) {
-	hash, err := d.HashPassword(password)
-	if err != nil {
-		return 0, fmt.Errorf("failed to hash password: %w", err)
+	// Validate inputs
+	if strings.TrimSpace(name) == "" {
+		return 0, fmt.Errorf("member name cannot be empty")
 	}
 
-	res, err := d.addMemberStmt.Exec(name, hash)
+	// Hash password with validation
+	hashedPassword, err := d.HashPassword(password)
 	if err != nil {
 		return 0, err
 	}
+
+	// Insert member
+	res, err := d.addMemberStmt.Exec(name, hashedPassword)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return 0, fmt.Errorf("member with name '%s' already exists", name)
+		}
+		return 0, fmt.Errorf("failed to add member: %w", err)
+	}
+
 	return res.LastInsertId()
 }
+
+// ---------------------------------------------------------------------------
+// Book Management
+// ---------------------------------------------------------------------------
 
 // AddBook inserts a book when you already have the full content in memory.
 func (d *Database) AddBook(title, author, content string) (int64, error) {
@@ -294,7 +401,7 @@ func (d *Database) SearchBooks(q string) ([]*Book, error) {
 	// Use FTS5 for search
 	query := `SELECT b.id, b.title, b.author, b.content, b.available, COALESCE(b.borrower_id,0)
               FROM books_fts fts
-              JOIN books b ON fts.rowid = b.id
+              JOIN books b ON fts.content_id = b.id
               WHERE books_fts MATCH ?
               ORDER BY rank`
 
@@ -324,6 +431,11 @@ func (d *Database) SearchBooks(q string) ([]*Book, error) {
 	return books, rows.Err()
 }
 
+// ---------------------------------------------------------------------------
+// Circulation with Authorization Checks
+// ---------------------------------------------------------------------------
+
+// CheckoutBook performs a book checkout with proper validation
 func (d *Database) CheckoutBook(bookID, memberID int64) error {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -344,6 +456,16 @@ func (d *Database) CheckoutBook(bookID, memberID int64) error {
 		return fmt.Errorf("book is not available")
 	}
 
+	// Verify member exists
+	var memberName string
+	err = tx.QueryRow(`SELECT name FROM members WHERE id=?`, memberID).Scan(&memberName)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("member not found")
+	}
+	if err != nil {
+		return err
+	}
+
 	// Update book as checked out
 	if _, err := tx.Exec(`UPDATE books SET available=0, borrower_id=? WHERE id=?`, memberID, bookID); err != nil {
 		return err
@@ -357,6 +479,7 @@ func (d *Database) CheckoutBook(bookID, memberID int64) error {
 	return tx.Commit()
 }
 
+// ReserveBook implements proper reservation logic with fix for the "already borrowed" bug
 func (d *Database) ReserveBook(bookID, memberID int64) error {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -370,6 +493,16 @@ func (d *Database) ReserveBook(bookID, memberID int64) error {
 	err = tx.QueryRow(`SELECT available, borrower_id FROM books WHERE id=?`, bookID).Scan(&available, &borrowerID)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("book not found")
+	}
+	if err != nil {
+		return err
+	}
+
+	// Verify member exists
+	var memberName string
+	err = tx.QueryRow(`SELECT name FROM members WHERE id=?`, memberID).Scan(&memberName)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("member not found")
 	}
 	if err != nil {
 		return err
@@ -390,7 +523,11 @@ func (d *Database) ReserveBook(bookID, memberID int64) error {
 		return tx.Commit()
 	}
 
-	// Book is not available, make a reservation
+	// CRITICAL FIX: Check if member is the current borrower
+	if borrowerID.Valid && borrowerID.Int64 == memberID {
+		return fmt.Errorf("you already have this book checked out")
+	}
+
 	// Check if member already has a reservation for this book
 	var existingID int64
 	err = tx.QueryRow(`SELECT id FROM reservations WHERE book_id=? AND member_id=? AND fulfilled_time IS NULL`, bookID, memberID).Scan(&existingID)
@@ -410,8 +547,7 @@ func (d *Database) ReserveBook(bookID, memberID int64) error {
 }
 
 // ReturnBook marks a book as returned and assigns it to the next person in the reservation queue.
-// Returns (returnedByMemberID, assignedToMemberID, error).
-// If no one is waiting, assignedToMemberID will be 0.
+// Returns the member ID who returned the book.
 func (d *Database) ReturnBook(bookID int64) (int64, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -470,65 +606,27 @@ func (d *Database) ReturnBook(bookID int64) (int64, error) {
 	return borrowerID, tx.Commit()
 }
 
-// ReturnBookWithDetails provides more information about the return process
-func (d *Database) ReturnBookWithDetails(bookID int64) (returnedBy int64, assignedTo int64, err error) {
-	tx, err := d.db.Begin()
-	if err != nil {
-		return 0, 0, err
-	}
-	defer tx.Rollback()
-
-	// Get current borrower
-	var borrowerID int64
+// VerifyReturnAuthorization checks if a member can return a specific book
+func (d *Database) VerifyReturnAuthorization(bookID, memberID int64) error {
+	var borrowerID sql.NullInt64
 	var available bool
-	err = tx.QueryRow(`SELECT borrower_id, available FROM books WHERE id=?`, bookID).Scan(&borrowerID, &available)
+	err := d.db.QueryRow(`SELECT borrower_id, available FROM books WHERE id=?`, bookID).Scan(&borrowerID, &available)
 	if err == sql.ErrNoRows {
-		return 0, 0, fmt.Errorf("book not found")
+		return fmt.Errorf("book not found")
 	}
 	if err != nil {
-		return 0, 0, err
+		return fmt.Errorf("database error: %w", err)
 	}
+
 	if available {
-		return 0, 0, fmt.Errorf("book is not checked out")
+		return fmt.Errorf("book is not currently checked out")
 	}
 
-	// Mark current checkout as returned
-	if _, err := tx.Exec(`UPDATE checkouts SET return_time=CURRENT_TIMESTAMP WHERE book_id=? AND member_id=? AND return_time IS NULL`, bookID, borrowerID); err != nil {
-		return 0, 0, err
+	if !borrowerID.Valid || borrowerID.Int64 != memberID {
+		return fmt.Errorf("you can only return books that you have checked out")
 	}
 
-	// Check for reservations
-	var nextMemberID sql.NullInt64
-	err = tx.QueryRow(`SELECT member_id FROM reservations WHERE book_id=? AND fulfilled_time IS NULL ORDER BY reservation_time LIMIT 1`, bookID).Scan(&nextMemberID)
-	if err != nil && err != sql.ErrNoRows {
-		return 0, 0, err
-	}
-
-	if nextMemberID.Valid {
-		// Assign to next member in queue
-		if _, err := tx.Exec(`UPDATE books SET borrower_id=? WHERE id=?`, nextMemberID.Int64, bookID); err != nil {
-			return 0, 0, err
-		}
-
-		// Mark reservation as fulfilled
-		if _, err := tx.Exec(`UPDATE reservations SET fulfilled_time=CURRENT_TIMESTAMP WHERE book_id=? AND member_id=?`, bookID, nextMemberID.Int64); err != nil {
-			return 0, 0, err
-		}
-
-		// Create new checkout record
-		if _, err := tx.Exec(`INSERT INTO checkouts(book_id, member_id) VALUES(?,?)`, bookID, nextMemberID.Int64); err != nil {
-			return 0, 0, err
-		}
-
-		return borrowerID, nextMemberID.Int64, tx.Commit()
-	} else {
-		// No one waiting, make available
-		if _, err := tx.Exec(`UPDATE books SET available=1, borrower_id=NULL WHERE id=?`, bookID); err != nil {
-			return 0, 0, err
-		}
-
-		return borrowerID, 0, tx.Commit()
-	}
+	return nil
 }
 
 func (d *Database) UpdateBookContent(bookID int64, content string) error {
@@ -538,11 +636,18 @@ func (d *Database) UpdateBookContent(bookID int64, content string) error {
 
 func (d *Database) GetMember(id int64) (*Member, error) {
 	var m Member
+	var passwordHash sql.NullString
 	err := d.db.QueryRow(`SELECT id,name,password_hash FROM members WHERE id=?`, id).
-		Scan(&m.ID, &m.Name, &m.PasswordHash)
+		Scan(&m.ID, &m.Name, &passwordHash)
 	if err != nil {
 		return nil, err
 	}
+
+	// Only set password hash if it exists (backwards compatibility)
+	if passwordHash.Valid {
+		m.PasswordHash = passwordHash.String
+	}
+
 	return &m, nil
 }
 
@@ -556,16 +661,23 @@ func (d *Database) GetAllMembers() ([]*Member, error) {
 	var members []*Member
 	for rows.Next() {
 		var m Member
-		if err := rows.Scan(&m.ID, &m.Name, &m.PasswordHash); err != nil {
+		var passwordHash sql.NullString
+		if err := rows.Scan(&m.ID, &m.Name, &passwordHash); err != nil {
 			return nil, err
 		}
+
+		// Only set password hash if it exists (backwards compatibility)
+		if passwordHash.Valid {
+			m.PasswordHash = passwordHash.String
+		}
+
 		members = append(members, &m)
 	}
 	return members, rows.Err()
 }
 
 func (d *Database) GetReservations(bookID int64) ([]*Member, error) {
-	query := `SELECT m.id, m.name, m.password_hash
+	query := `SELECT m.id, m.name, COALESCE(m.password_hash, '') as password_hash
               FROM reservations r
               JOIN members m ON r.member_id = m.id
               WHERE r.book_id = ? AND r.fulfilled_time IS NULL
@@ -580,9 +692,11 @@ func (d *Database) GetReservations(bookID int64) ([]*Member, error) {
 	var members []*Member
 	for rows.Next() {
 		var m Member
-		if err := rows.Scan(&m.ID, &m.Name, &m.PasswordHash); err != nil {
+		var passwordHash string
+		if err := rows.Scan(&m.ID, &m.Name, &passwordHash); err != nil {
 			return nil, err
 		}
+		m.PasswordHash = passwordHash
 		members = append(members, &m)
 	}
 	return members, rows.Err()
@@ -629,6 +743,10 @@ func (d *Database) CancelReservation(bookID, memberID int64) error {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Reading System with Proper Validation
+// ---------------------------------------------------------------------------
+
 type ReadBookValidation struct {
 	BookExists        bool
 	BookTitle         string
@@ -640,9 +758,10 @@ type ReadBookValidation struct {
 	MemberExists      bool
 	MemberName        string
 	CanAutoCheckout   bool // Book is available for checkout
-	CanRead           bool // Member can read (owns book or can auto-checkout)
+	CanRead           bool // Member can read (owns book or can auto-checkout with content)
 }
 
+// ValidateReadBookAccess performs comprehensive validation for reading permissions
 func (d *Database) ValidateReadBookAccess(bookID, memberID int64) (*ReadBookValidation, error) {
 	v := &ReadBookValidation{}
 
@@ -655,39 +774,39 @@ func (d *Database) ValidateReadBookAccess(bookID, memberID int64) (*ReadBookVali
 
 	if err == sql.ErrNoRows {
 		v.BookExists = false
-		return v, nil
-	}
-	if err != nil {
+		// Still need to check if member exists for complete validation
+	} else if err != nil {
 		return nil, err
+	} else {
+		v.BookExists = true
+		v.BookTitle = title
+		v.BookAuthor = author
+		v.BookAvailable = available
+		if borrowerID.Valid {
+			v.BookBorrowerID = borrowerID.Int64
+		}
+		v.BookContentLength = len(content)
+		v.HasContent = len(strings.TrimSpace(content)) > 0
 	}
-
-	v.BookExists = true
-	v.BookTitle = title
-	v.BookAuthor = author
-	v.BookAvailable = available
-	if borrowerID.Valid {
-		v.BookBorrowerID = borrowerID.Int64
-	}
-	v.BookContentLength = len(content)
-	v.HasContent = len(strings.TrimSpace(content)) > 0
 
 	// Check member exists
 	var memberName string
 	err = d.db.QueryRow(`SELECT name FROM members WHERE id=?`, memberID).Scan(&memberName)
 	if err == sql.ErrNoRows {
 		v.MemberExists = false
-		return v, nil
-	}
-	if err != nil {
+	} else if err != nil {
 		return nil, err
+	} else {
+		v.MemberExists = true
+		v.MemberName = memberName
 	}
 
-	v.MemberExists = true
-	v.MemberName = memberName
-
-	// Determine access rights
-	v.CanAutoCheckout = available
-	v.CanRead = available || (borrowerID.Valid && borrowerID.Int64 == memberID)
+	// Determine access rights - fix the logic flaws from Sonnet
+	if v.BookExists && v.MemberExists {
+		v.CanAutoCheckout = available && v.HasContent
+		// FIXED: CanRead should only be true if there's content AND either available or member owns it
+		v.CanRead = v.HasContent && (available || (borrowerID.Valid && borrowerID.Int64 == memberID))
+	}
 
 	return v, nil
 }

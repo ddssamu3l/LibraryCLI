@@ -1,21 +1,20 @@
 package library
 
-// Book represents metadata and current availability of a book in the library.
-// The full text of the book is stored in the `content` column in the SQLite database.
+// Book represents a book in the library.
 type Book struct {
 	ID         int64  `json:"id"`
 	Title      string `json:"title"`
 	Author     string `json:"author"`
 	Content    string `json:"content"`
 	Available  bool   `json:"available"`
-	BorrowerID int64  `json:"borrower_id"`
+	BorrowerID int64  `json:"borrower_id,omitempty"`
 }
 
-// Member represents a registered library member.
+// Member represents a library member with secure password handling.
 type Member struct {
 	ID           int64  `json:"id"`
 	Name         string `json:"name"`
-	PasswordHash string `json:"-"` // Don't serialize password hash
+	PasswordHash string `json:"-"` // Excluded from JSON serialization for security
 }
 
 // LibraryData represents the complete library state for persistence
