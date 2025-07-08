@@ -8,9 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Database provides high-level helpers around a SQLite connection.
@@ -66,7 +66,7 @@ func (d *Database) Close() error {
 // Schema migration
 // ---------------------------------------------------------------------------
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 func applyMigrations(db *sql.DB) error {
 	// WAL improves write concurrency.
@@ -93,7 +93,8 @@ func applyMigrations(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS members (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL
+            name TEXT NOT NULL,
+            password_hash TEXT NOT NULL DEFAULT ''
         );`,
 		`CREATE TABLE IF NOT EXISTS books (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,6 +134,8 @@ func applyMigrations(db *sql.DB) error {
             INSERT INTO books_fts(books_fts, rowid, title, author, content) VALUES('delete',old.id,old.title,old.author,old.content);
             INSERT INTO books_fts(rowid,title,author,content) VALUES(new.id,new.title,new.author,new.content);
         END;`,
+		// Migration for existing members without passwords
+		`UPDATE members SET password_hash = '' WHERE password_hash IS NULL;`,
 		`INSERT INTO meta(key,value) VALUES('schema_version',?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value;`,
 	}
@@ -155,18 +158,84 @@ func (d *Database) prepareStatements() error {
 	if d.addBookStmt, err = d.db.Prepare(`INSERT INTO books(title,author,content) VALUES(?,?,?)`); err != nil {
 		return err
 	}
-	if d.addMemberStmt, err = d.db.Prepare(`INSERT INTO members(name) VALUES(?)`); err != nil {
+	if d.addMemberStmt, err = d.db.Prepare(`INSERT INTO members(name,password_hash) VALUES(?,?)`); err != nil {
 		return err
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// CRUD helpers
+// Authentication helpers
 // ---------------------------------------------------------------------------
 
-func (d *Database) AddMember(name string) (int64, error) {
-	res, err := d.addMemberStmt.Exec(name)
+// HashPassword creates a bcrypt hash of the password
+func (d *Database) HashPassword(password string) (string, error) {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return string(bytes), err
+}
+
+// CheckPassword verifies a password against its hash
+func (d *Database) CheckPassword(password, hash string) bool {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	return err == nil
+}
+
+// AuthenticateMember verifies member credentials
+func (d *Database) AuthenticateMember(memberID int64, password string) error {
+	var hash string
+	err := d.db.QueryRow(`SELECT password_hash FROM members WHERE id=?`, memberID).Scan(&hash)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("member not found")
+	}
+	if err != nil {
+		return err
+	}
+
+	if hash == "" {
+		return fmt.Errorf("member has no password set - please contact administrator")
+	}
+
+	if !d.CheckPassword(password, hash) {
+		return fmt.Errorf("invalid password")
+	}
+
+	return nil
+}
+
+// ResetMemberPassword updates a member's password
+func (d *Database) ResetMemberPassword(memberID int64, newPassword string) error {
+	hash, err := d.HashPassword(newPassword)
+	if err != nil {
+		return fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	result, err := d.db.Exec(`UPDATE members SET password_hash=? WHERE id=?`, hash, memberID)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("member not found")
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// CRUD helpers (updated)
+// ---------------------------------------------------------------------------
+
+func (d *Database) AddMember(name, password string) (int64, error) {
+	hash, err := d.HashPassword(password)
+	if err != nil {
+		return 0, fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	res, err := d.addMemberStmt.Exec(name, hash)
 	if err != nil {
 		return 0, err
 	}
@@ -203,9 +272,8 @@ func (d *Database) GetBook(id int64) (*Book, error) {
 	return &b, nil
 }
 
-// GetAllBooks returns metadata only (no heavy content) for quick listing.
 func (d *Database) GetAllBooks() ([]*Book, error) {
-	rows, err := d.db.Query(`SELECT id,title,author,available,COALESCE(borrower_id,0) FROM books ORDER BY id`)
+	rows, err := d.db.Query(`SELECT id,title,author,content,available,COALESCE(borrower_id,0) FROM books ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -214,42 +282,48 @@ func (d *Database) GetAllBooks() ([]*Book, error) {
 	var books []*Book
 	for rows.Next() {
 		var b Book
-		if err := rows.Scan(&b.ID, &b.Title, &b.Author, &b.Available, &b.BorrowerID); err != nil {
+		if err := rows.Scan(&b.ID, &b.Title, &b.Author, &b.Content, &b.Available, &b.BorrowerID); err != nil {
 			return nil, err
 		}
 		books = append(books, &b)
 	}
-	return books, nil
+	return books, rows.Err()
 }
 
-// SearchBooks leverages FTS5. It returns lightweight rows.
 func (d *Database) SearchBooks(q string) ([]*Book, error) {
-	if strings.TrimSpace(q) == "" {
-		return []*Book{}, nil
-	}
-	rows, err := d.db.Query(`
-        SELECT b.id, b.title, b.author, b.available, COALESCE(b.borrower_id,0)
-        FROM books_fts fts
-        JOIN books b ON b.id = fts.rowid
-        WHERE books_fts MATCH ?
-        ORDER BY rank;`, q)
+	// Use FTS5 for search
+	query := `SELECT b.id, b.title, b.author, b.content, b.available, COALESCE(b.borrower_id,0)
+              FROM books_fts fts
+              JOIN books b ON fts.rowid = b.id
+              WHERE books_fts MATCH ?
+              ORDER BY rank`
+
+	rows, err := d.db.Query(query, q)
 	if err != nil {
-		return nil, err
+		// If FTS fails, fall back to LIKE search
+		fallbackQuery := `SELECT id,title,author,content,available,COALESCE(borrower_id,0) 
+                          FROM books 
+                          WHERE title LIKE ? OR author LIKE ? 
+                          ORDER BY id`
+		likePattern := "%" + q + "%"
+		rows, err = d.db.Query(fallbackQuery, likePattern, likePattern)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 
-	var results []*Book
+	var books []*Book
 	for rows.Next() {
 		var b Book
-		if err := rows.Scan(&b.ID, &b.Title, &b.Author, &b.Available, &b.BorrowerID); err != nil {
+		if err := rows.Scan(&b.ID, &b.Title, &b.Author, &b.Content, &b.Available, &b.BorrowerID); err != nil {
 			return nil, err
 		}
-		results = append(results, &b)
+		books = append(books, &b)
 	}
-	return results, nil
+	return books, rows.Err()
 }
 
-// CheckoutBook records the checkout and updates availability in one transaction.
 func (d *Database) CheckoutBook(bookID, memberID int64) error {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -257,36 +331,32 @@ func (d *Database) CheckoutBook(bookID, memberID int64) error {
 	}
 	defer tx.Rollback()
 
-	var avail bool
-	if err := tx.QueryRow(`SELECT available FROM books WHERE id=?`, bookID).Scan(&avail); err != nil {
+	// Check if book exists and is available
+	var available bool
+	err = tx.QueryRow(`SELECT available FROM books WHERE id=?`, bookID).Scan(&available)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("book not found")
+	}
+	if err != nil {
 		return err
 	}
-	if !avail {
-		return fmt.Errorf("book %d already checked out", bookID)
+	if !available {
+		return fmt.Errorf("book is not available")
 	}
 
-	if _, err := tx.Exec(`INSERT INTO checkouts(book_id,member_id) VALUES(?,?)`, bookID, memberID); err != nil {
-		return err
-	}
+	// Update book as checked out
 	if _, err := tx.Exec(`UPDATE books SET available=0, borrower_id=? WHERE id=?`, memberID, bookID); err != nil {
 		return err
 	}
+
+	// Record checkout
+	if _, err := tx.Exec(`INSERT INTO checkouts(book_id, member_id) VALUES(?,?)`, bookID, memberID); err != nil {
+		return err
+	}
+
 	return tx.Commit()
 }
 
-// ReserveBook places a reservation for a book by a member, or checks it out immediately if available.
-//
-// The function performs comprehensive validation:
-// - Verifies both book and member exist in the database
-// - Prevents duplicate reservations (member already has an active reservation for this book)
-// - Prevents reserving a book the member already has checked out
-//
-// Behavior depends on book availability:
-// - If book is available: immediately checks it out to the member
-// - If book is unavailable: adds the member to the reservation queue (FIFO order)
-//
-// All operations are performed within a single database transaction to ensure consistency
-// and prevent race conditions in concurrent scenarios.
 func (d *Database) ReserveBook(bookID, memberID int64) error {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -294,83 +364,54 @@ func (d *Database) ReserveBook(bookID, memberID int64) error {
 	}
 	defer tx.Rollback()
 
-	var exists bool
-	// Verify book exists
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM books WHERE id=?)`, bookID).Scan(&exists); err != nil {
-		return err
+	// Check if book exists
+	var available bool
+	var borrowerID sql.NullInt64
+	err = tx.QueryRow(`SELECT available, borrower_id FROM books WHERE id=?`, bookID).Scan(&available, &borrowerID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("book not found")
 	}
-	if !exists {
-		return fmt.Errorf("book %d does not exist", bookID)
-	}
-
-	// Verify member exists
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM members WHERE id=?)`, memberID).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		return fmt.Errorf("member %d does not exist", memberID)
-	}
-
-	// Check duplicate active reservation
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM reservations WHERE book_id=? AND member_id=? AND fulfilled_time IS NULL)`, bookID, memberID).Scan(&exists); err != nil {
-		return err
-	}
-	if exists {
-		return fmt.Errorf("you already have a reservation for this book")
-	}
-
-	// Check if member already has this book checked out
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM checkouts WHERE book_id=? AND member_id=? AND return_time IS NULL)`, bookID, memberID).Scan(&exists); err != nil {
-		return err
-	}
-	if exists {
-		return fmt.Errorf("you can't reserve this book because you have already checked it out")
-	}
-
-	// Check availability
-	var avail bool
-	if err := tx.QueryRow(`SELECT available FROM books WHERE id=?`, bookID).Scan(&avail); err != nil {
+	if err != nil {
 		return err
 	}
 
-	if avail {
-		// Immediate checkout
-		if _, err := tx.Exec(`INSERT INTO checkouts(book_id,member_id) VALUES(?,?)`, bookID, memberID); err != nil {
-			return err
-		}
+	// If book is available, check it out immediately instead of reserving
+	if available {
+		// Update book as checked out
 		if _, err := tx.Exec(`UPDATE books SET available=0, borrower_id=? WHERE id=?`, memberID, bookID); err != nil {
 			return err
 		}
-	} else {
-		// Queue reservation
-		if _, err := tx.Exec(`INSERT INTO reservations(book_id,member_id) VALUES(?,?)`, bookID, memberID); err != nil {
-			// Handle database constraint violations with user-friendly messages
-			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-				return fmt.Errorf("you already have a reservation for this book")
-			}
+
+		// Record checkout
+		if _, err := tx.Exec(`INSERT INTO checkouts(book_id, member_id) VALUES(?,?)`, bookID, memberID); err != nil {
 			return err
 		}
+
+		return tx.Commit()
+	}
+
+	// Book is not available, make a reservation
+	// Check if member already has a reservation for this book
+	var existingID int64
+	err = tx.QueryRow(`SELECT id FROM reservations WHERE book_id=? AND member_id=? AND fulfilled_time IS NULL`, bookID, memberID).Scan(&existingID)
+	if err == nil {
+		return fmt.Errorf("member already has a reservation for this book")
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+
+	// Create reservation
+	if _, err := tx.Exec(`INSERT INTO reservations(book_id, member_id) VALUES(?,?)`, bookID, memberID); err != nil {
+		return err
 	}
 
 	return tx.Commit()
 }
 
-// ReturnBook marks a book as returned and automatically assigns it to the next member in the reservation queue.
-//
-// The function performs the following operations within a single transaction:
-// 1. Validates that the book is currently checked out
-// 2. Updates the checkout record with a return timestamp
-// 3. Checks for active reservations for this book (ordered by reservation_time)
-// 4. If reservations exist:
-//   - Automatically checks out the book to the next member in queue (FIFO)
-//   - Marks their reservation as fulfilled
-//   - Book remains unavailable but with new borrower
-//
-// 5. If no reservations exist:
-//   - Makes the book available for general checkout
-//
-// Returns the ID of the member who returned the book.
-// All operations are atomic to prevent race conditions during concurrent returns and reservations.
+// ReturnBook marks a book as returned and assigns it to the next person in the reservation queue.
+// Returns (returnedByMemberID, assignedToMemberID, error).
+// If no one is waiting, assignedToMemberID will be 0.
 func (d *Database) ReturnBook(bookID int64) (int64, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -378,86 +419,159 @@ func (d *Database) ReturnBook(bookID int64) (int64, error) {
 	}
 	defer tx.Rollback()
 
-	var chkID, memberID int64
-	err = tx.QueryRow(`SELECT id, member_id FROM checkouts WHERE book_id=? AND return_time IS NULL`, bookID).
-		Scan(&chkID, &memberID)
+	// Get current borrower
+	var borrowerID int64
+	var available bool
+	err = tx.QueryRow(`SELECT borrower_id, available FROM books WHERE id=?`, bookID).Scan(&borrowerID, &available)
 	if err == sql.ErrNoRows {
-		return 0, fmt.Errorf("book %d is not checked out", bookID)
+		return 0, fmt.Errorf("book not found")
 	}
 	if err != nil {
 		return 0, err
 	}
+	if available {
+		return 0, fmt.Errorf("book is not checked out")
+	}
 
-	// Mark as returned
-	if _, err := tx.Exec(`UPDATE checkouts SET return_time=? WHERE id=?`, time.Now(), chkID); err != nil {
+	// Mark current checkout as returned
+	if _, err := tx.Exec(`UPDATE checkouts SET return_time=CURRENT_TIMESTAMP WHERE book_id=? AND member_id=? AND return_time IS NULL`, bookID, borrowerID); err != nil {
 		return 0, err
 	}
 
-	// Fetch next reservation (oldest)
+	// Check for reservations
 	var nextMemberID sql.NullInt64
-	var reservationID sql.NullInt64
-	err = tx.QueryRow(`SELECT id, member_id FROM reservations WHERE book_id=? AND fulfilled_time IS NULL ORDER BY reservation_time ASC LIMIT 1`, bookID).
-		Scan(&reservationID, &nextMemberID)
+	err = tx.QueryRow(`SELECT member_id FROM reservations WHERE book_id=? AND fulfilled_time IS NULL ORDER BY reservation_time LIMIT 1`, bookID).Scan(&nextMemberID)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
+	}
 
-	if err == nil && nextMemberID.Valid {
-		// Assign to next member
-		if _, err := tx.Exec(`INSERT INTO checkouts(book_id,member_id) VALUES(?,?)`, bookID, nextMemberID.Int64); err != nil {
-			return 0, err
-		}
+	if nextMemberID.Valid {
+		// Assign to next member in queue
 		if _, err := tx.Exec(`UPDATE books SET borrower_id=? WHERE id=?`, nextMemberID.Int64, bookID); err != nil {
 			return 0, err
 		}
-		if _, err := tx.Exec(`UPDATE reservations SET fulfilled_time=? WHERE id=?`, time.Now(), reservationID.Int64); err != nil {
+
+		// Mark reservation as fulfilled
+		if _, err := tx.Exec(`UPDATE reservations SET fulfilled_time=CURRENT_TIMESTAMP WHERE book_id=? AND member_id=?`, bookID, nextMemberID.Int64); err != nil {
 			return 0, err
 		}
-	} else if err == sql.ErrNoRows {
-		// No reservations, make available
+
+		// Create new checkout record
+		if _, err := tx.Exec(`INSERT INTO checkouts(book_id, member_id) VALUES(?,?)`, bookID, nextMemberID.Int64); err != nil {
+			return 0, err
+		}
+	} else {
+		// No one waiting, make available
 		if _, err := tx.Exec(`UPDATE books SET available=1, borrower_id=NULL WHERE id=?`, bookID); err != nil {
 			return 0, err
 		}
-	} else if err != nil {
-		return 0, err
 	}
 
-	return memberID, tx.Commit()
+	return borrowerID, tx.Commit()
 }
 
-// UpdateBookContent replaces the book's stored text.
+// ReturnBookWithDetails provides more information about the return process
+func (d *Database) ReturnBookWithDetails(bookID int64) (returnedBy int64, assignedTo int64, err error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+
+	// Get current borrower
+	var borrowerID int64
+	var available bool
+	err = tx.QueryRow(`SELECT borrower_id, available FROM books WHERE id=?`, bookID).Scan(&borrowerID, &available)
+	if err == sql.ErrNoRows {
+		return 0, 0, fmt.Errorf("book not found")
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	if available {
+		return 0, 0, fmt.Errorf("book is not checked out")
+	}
+
+	// Mark current checkout as returned
+	if _, err := tx.Exec(`UPDATE checkouts SET return_time=CURRENT_TIMESTAMP WHERE book_id=? AND member_id=? AND return_time IS NULL`, bookID, borrowerID); err != nil {
+		return 0, 0, err
+	}
+
+	// Check for reservations
+	var nextMemberID sql.NullInt64
+	err = tx.QueryRow(`SELECT member_id FROM reservations WHERE book_id=? AND fulfilled_time IS NULL ORDER BY reservation_time LIMIT 1`, bookID).Scan(&nextMemberID)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, 0, err
+	}
+
+	if nextMemberID.Valid {
+		// Assign to next member in queue
+		if _, err := tx.Exec(`UPDATE books SET borrower_id=? WHERE id=?`, nextMemberID.Int64, bookID); err != nil {
+			return 0, 0, err
+		}
+
+		// Mark reservation as fulfilled
+		if _, err := tx.Exec(`UPDATE reservations SET fulfilled_time=CURRENT_TIMESTAMP WHERE book_id=? AND member_id=?`, bookID, nextMemberID.Int64); err != nil {
+			return 0, 0, err
+		}
+
+		// Create new checkout record
+		if _, err := tx.Exec(`INSERT INTO checkouts(book_id, member_id) VALUES(?,?)`, bookID, nextMemberID.Int64); err != nil {
+			return 0, 0, err
+		}
+
+		return borrowerID, nextMemberID.Int64, tx.Commit()
+	} else {
+		// No one waiting, make available
+		if _, err := tx.Exec(`UPDATE books SET available=1, borrower_id=NULL WHERE id=?`, bookID); err != nil {
+			return 0, 0, err
+		}
+
+		return borrowerID, 0, tx.Commit()
+	}
+}
+
 func (d *Database) UpdateBookContent(bookID int64, content string) error {
 	_, err := d.db.Exec(`UPDATE books SET content=? WHERE id=?`, content, bookID)
 	return err
 }
 
-// GetMember fetches a single member.
 func (d *Database) GetMember(id int64) (*Member, error) {
 	var m Member
-	if err := d.db.QueryRow(`SELECT id,name FROM members WHERE id=?`, id).Scan(&m.ID, &m.Name); err != nil {
+	err := d.db.QueryRow(`SELECT id,name,password_hash FROM members WHERE id=?`, id).
+		Scan(&m.ID, &m.Name, &m.PasswordHash)
+	if err != nil {
 		return nil, err
 	}
 	return &m, nil
 }
 
-// GetAllMembers returns all members.
 func (d *Database) GetAllMembers() ([]*Member, error) {
-	rows, err := d.db.Query(`SELECT id,name FROM members ORDER BY id`)
+	rows, err := d.db.Query(`SELECT id,name,password_hash FROM members ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+
 	var members []*Member
 	for rows.Next() {
 		var m Member
-		if err := rows.Scan(&m.ID, &m.Name); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.PasswordHash); err != nil {
 			return nil, err
 		}
 		members = append(members, &m)
 	}
-	return members, nil
+	return members, rows.Err()
 }
 
-// GetReservations returns active reservations for a book ordered by time.
 func (d *Database) GetReservations(bookID int64) ([]*Member, error) {
-	rows, err := d.db.Query(`SELECT m.id, m.name FROM reservations r JOIN members m ON m.id = r.member_id WHERE r.book_id = ? AND r.fulfilled_time IS NULL ORDER BY r.reservation_time ASC`, bookID)
+	query := `SELECT m.id, m.name, m.password_hash
+              FROM reservations r
+              JOIN members m ON r.member_id = m.id
+              WHERE r.book_id = ? AND r.fulfilled_time IS NULL
+              ORDER BY r.reservation_time`
+
+	rows, err := d.db.Query(query, bookID)
 	if err != nil {
 		return nil, err
 	}
@@ -466,17 +580,22 @@ func (d *Database) GetReservations(bookID int64) ([]*Member, error) {
 	var members []*Member
 	for rows.Next() {
 		var m Member
-		if err := rows.Scan(&m.ID, &m.Name); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.PasswordHash); err != nil {
 			return nil, err
 		}
 		members = append(members, &m)
 	}
-	return members, nil
+	return members, rows.Err()
 }
 
-// GetMemberReservations returns active reservations for a member.
 func (d *Database) GetMemberReservations(memberID int64) ([]*Book, error) {
-	rows, err := d.db.Query(`SELECT b.id, b.title, b.author, b.available, COALESCE(b.borrower_id,0) FROM reservations r JOIN books b ON b.id = r.book_id WHERE r.member_id = ? AND r.fulfilled_time IS NULL ORDER BY r.reservation_time ASC`, memberID)
+	query := `SELECT b.id, b.title, b.author, b.content, b.available, COALESCE(b.borrower_id,0)
+              FROM reservations r
+              JOIN books b ON r.book_id = b.id
+              WHERE r.member_id = ? AND r.fulfilled_time IS NULL
+              ORDER BY r.reservation_time`
+
+	rows, err := d.db.Query(query, memberID)
 	if err != nil {
 		return nil, err
 	}
@@ -485,32 +604,31 @@ func (d *Database) GetMemberReservations(memberID int64) ([]*Book, error) {
 	var books []*Book
 	for rows.Next() {
 		var b Book
-		if err := rows.Scan(&b.ID, &b.Title, &b.Author, &b.Available, &b.BorrowerID); err != nil {
+		if err := rows.Scan(&b.ID, &b.Title, &b.Author, &b.Content, &b.Available, &b.BorrowerID); err != nil {
 			return nil, err
 		}
 		books = append(books, &b)
 	}
-	return books, nil
+	return books, rows.Err()
 }
 
-// CancelReservation deletes an active reservation.
 func (d *Database) CancelReservation(bookID, memberID int64) error {
 	result, err := d.db.Exec(`DELETE FROM reservations WHERE book_id=? AND member_id=? AND fulfilled_time IS NULL`, bookID, memberID)
 	if err != nil {
 		return err
 	}
+
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
 	if rows == 0 {
-		return fmt.Errorf("no active reservation found for member %d on book %d", memberID, bookID)
+		return fmt.Errorf("no active reservation found for this book and member")
 	}
+
 	return nil
 }
 
-// ValidateReadBookAccess performs all validation for read book access in one optimized query.
-// Returns book content length, member name, current borrower ID (if any), and access validation.
 type ReadBookValidation struct {
 	BookExists        bool
 	BookTitle         string
@@ -526,62 +644,69 @@ type ReadBookValidation struct {
 }
 
 func (d *Database) ValidateReadBookAccess(bookID, memberID int64) (*ReadBookValidation, error) {
-	// Single optimized query using LEFT JOINs to distinguish book vs member existence
-	query := `
-		SELECT 
-			b.id IS NOT NULL as book_exists,
-			COALESCE(b.title, '') as book_title,
-			COALESCE(b.author, '') as book_author,
-			COALESCE(b.available, 0) as book_available,
-			COALESCE(b.borrower_id, 0) as book_borrower_id,
-			LENGTH(COALESCE(b.content, '')) as content_length,
-			CASE 
-				WHEN b.content IS NULL THEN 0
-				WHEN TRIM(b.content, ' \t\n\r') = '' THEN 0
-				ELSE 1
-			END as has_content,
-			m.id IS NOT NULL as member_exists,
-			COALESCE(m.name, '') as member_name
-		FROM (SELECT ? as bid, ? as mid) params
-		LEFT JOIN books b ON b.id = params.bid
-		LEFT JOIN members m ON m.id = params.mid
-	`
+	v := &ReadBookValidation{}
 
-	var validation ReadBookValidation
-	err := d.db.QueryRow(query, bookID, memberID).Scan(
-		&validation.BookExists,
-		&validation.BookTitle,
-		&validation.BookAuthor,
-		&validation.BookAvailable,
-		&validation.BookBorrowerID,
-		&validation.BookContentLength,
-		&validation.HasContent,
-		&validation.MemberExists,
-		&validation.MemberName,
-	)
+	// Check book exists and get details
+	var title, author, content string
+	var available bool
+	var borrowerID sql.NullInt64
+	err := d.db.QueryRow(`SELECT title, author, content, available, borrower_id FROM books WHERE id=?`, bookID).
+		Scan(&title, &author, &content, &available, &borrowerID)
 
+	if err == sql.ErrNoRows {
+		v.BookExists = false
+		return v, nil
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	// Determine access rights
-	validation.CanAutoCheckout = validation.BookExists && validation.BookAvailable
-	validation.CanRead = validation.BookExists && validation.MemberExists && validation.HasContent &&
-		(validation.BookAvailable || validation.BookBorrowerID == memberID)
+	v.BookExists = true
+	v.BookTitle = title
+	v.BookAuthor = author
+	v.BookAvailable = available
+	if borrowerID.Valid {
+		v.BookBorrowerID = borrowerID.Int64
+	}
+	v.BookContentLength = len(content)
+	v.HasContent = len(strings.TrimSpace(content)) > 0
 
-	// Only consider content relevant if both book and member exist
-	if !validation.BookExists || !validation.MemberExists {
-		validation.HasContent = false
+	// Check member exists
+	var memberName string
+	err = d.db.QueryRow(`SELECT name FROM members WHERE id=?`, memberID).Scan(&memberName)
+	if err == sql.ErrNoRows {
+		v.MemberExists = false
+		return v, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	return &validation, nil
+	v.MemberExists = true
+	v.MemberName = memberName
+
+	// Determine access rights
+	v.CanAutoCheckout = available
+	v.CanRead = available || (borrowerID.Valid && borrowerID.Int64 == memberID)
+
+	return v, nil
 }
 
-// GetBookContentChunk retrieves a specific chunk of book content for pagination.
-// This enables memory-efficient reading of large books.
 func (d *Database) GetBookContentChunk(bookID int64, offset, length int) (string, error) {
-	query := "SELECT SUBSTR(content, ?, ?) FROM books WHERE id = ?"
-	var chunk string
-	err := d.db.QueryRow(query, offset+1, length, bookID).Scan(&chunk) // SQL SUBSTR is 1-indexed
-	return chunk, err
+	var content string
+	err := d.db.QueryRow(`SELECT content FROM books WHERE id=?`, bookID).Scan(&content)
+	if err != nil {
+		return "", err
+	}
+
+	if offset >= len(content) {
+		return "", nil
+	}
+
+	end := offset + length
+	if end > len(content) {
+		end = len(content)
+	}
+
+	return content[offset:end], nil
 }

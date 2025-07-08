@@ -30,8 +30,8 @@ func TestValidateReadBookAccess(t *testing.T) {
 	content := "Test content for validation"
 	bookID, _ := db.AddBook("Test Book", "Test Author", content)
 	emptyBookID, _ := db.AddBook("Empty Book", "Test Author", "")
-	memberID, _ := db.AddMember("Test Member")
-	member2ID, _ := db.AddMember("Member 2")
+	memberID, _ := db.AddMember("Test Member", "password")
+	member2ID, _ := db.AddMember("Member 2", "password")
 
 	// Checkout book to member 2
 	db.CheckoutBook(bookID, member2ID)
@@ -183,8 +183,8 @@ func TestReadBookValidation(t *testing.T) {
 	content := "Test book content for validation testing."
 	bookID, _ := db.AddBook("Validation Test Book", "Author", content)
 	emptyBookID, _ := db.AddBook("Empty Book", "Author", "")
-	member1ID, _ := db.AddMember("Alice")
-	member2ID, _ := db.AddMember("Bob")
+	member1ID, _ := db.AddMember("Alice", "password")
+	member2ID, _ := db.AddMember("Bob", "password")
 
 	// Checkout book to member2
 	db.CheckoutBook(bookID, member2ID)
@@ -259,7 +259,7 @@ func TestReadBookAutoCheckout(t *testing.T) {
 
 	content := "This is content for auto-checkout testing."
 	bookID, _ := db.AddBook("Auto Checkout Book", "Author", content)
-	memberID, _ := db.AddMember("Reader")
+	memberID, _ := db.AddMember("Reader", "password")
 
 	// Verify book is initially available
 	book, _ := db.GetBook(bookID)
@@ -321,7 +321,7 @@ func TestReadBookMemoryEfficiency(t *testing.T) {
 	// Create a large book (simulate 50KB content)
 	largeContent := strings.Repeat("A", 50000)
 	bookID, _ := db.AddBook("Large Book", "Author", largeContent)
-	memberID, _ := db.AddMember("Reader")
+	memberID, _ := db.AddMember("Reader", "password")
 
 	// Checkout book first
 	db.CheckoutBook(bookID, memberID)
@@ -354,7 +354,7 @@ func TestReadBookSinglePageHandling(t *testing.T) {
 	// Create a book with less than 1500 characters (single page)
 	shortContent := "This is a short book with less than 1500 characters."
 	bookID, _ := db.AddBook("Short Book", "Author", shortContent)
-	memberID, _ := db.AddMember("Reader")
+	memberID, _ := db.AddMember("Reader", "password")
 
 	// Checkout book
 	db.CheckoutBook(bookID, memberID)
@@ -381,7 +381,7 @@ func TestReadBookDatabaseEfficiency(t *testing.T) {
 
 	content := "Test content for database efficiency"
 	bookID, _ := db.AddBook("Efficiency Test", "Author", content)
-	memberID, _ := db.AddMember("Reader")
+	memberID, _ := db.AddMember("Reader", "password")
 
 	// Test that ValidateReadBookAccess gets all needed info in one query
 	validation, err := db.ValidateReadBookAccess(bookID, memberID)
@@ -426,7 +426,7 @@ func TestReadBookWhitespaceContent(t *testing.T) {
 	// Create book with only whitespace
 	wsContent := "   \n\t  \r\n  "
 	bookID, _ := db.AddBook("Whitespace Book", "Author", wsContent)
-	memberID, _ := db.AddMember("Reader")
+	memberID, _ := db.AddMember("Reader", "password")
 
 	err := lm.ReadBook(bookID, memberID)
 	if err == nil {

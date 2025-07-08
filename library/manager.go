@@ -49,11 +49,21 @@ func (lm *LibraryManager) UpdateBookContent(id int64, content string) error {
 func (lm *LibraryManager) GetBook(id int64) (*Book, error) { return lm.db.GetBook(id) }
 func (lm *LibraryManager) GetAllBooks() ([]*Book, error)   { return lm.db.GetAllBooks() }
 
-// ------------------ Member helpers ------------------
+// ------------------ Member helpers (updated) ------------------
 
-func (lm *LibraryManager) AddMember(name string) (int64, error) { return lm.db.AddMember(name) }
-func (lm *LibraryManager) GetMember(id int64) (*Member, error)  { return lm.db.GetMember(id) }
-func (lm *LibraryManager) GetAllMembers() ([]*Member, error)    { return lm.db.GetAllMembers() }
+func (lm *LibraryManager) AddMember(name, password string) (int64, error) {
+	return lm.db.AddMember(name, password)
+}
+func (lm *LibraryManager) GetMember(id int64) (*Member, error) { return lm.db.GetMember(id) }
+func (lm *LibraryManager) GetAllMembers() ([]*Member, error)   { return lm.db.GetAllMembers() }
+
+func (lm *LibraryManager) AuthenticateMember(memberID int64, password string) error {
+	return lm.db.AuthenticateMember(memberID, password)
+}
+
+func (lm *LibraryManager) ResetMemberPassword(memberID int64, newPassword string) error {
+	return lm.db.ResetMemberPassword(memberID, newPassword)
+}
 
 // ------------------ Reservation helpers ------------------
 

@@ -7,8 +7,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"library-management/library"
+
+	"golang.org/x/term"
 )
 
 const dbFile = "library.db"
@@ -24,7 +27,7 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	fmt.Println("Welcome to the Library Management System (SQLite edition)!")
-	fmt.Println("Available commands: add book, add member, list books, list members, search book, advanced search, checkout, return, reserve, list reservations, cancel reservation, update content, read book, exit")
+	fmt.Println("Available commands: add book, add member, list books, list members, search book, checkout, return, reserve, list reservations, cancel reservation, update content, read book, reset password, exit")
 
 	for {
 		fmt.Print("\n> ")
@@ -58,6 +61,8 @@ func main() {
 			handleUpdateContent(scanner, manager)
 		case "read book":
 			handleReadBook(scanner, manager)
+		case "reset password":
+			handleResetPassword(scanner, manager)
 		case "exit":
 			fmt.Println("Goodbye!")
 			return
@@ -80,37 +85,37 @@ func handleAddBook(sc *bufio.Scanner, mgr *library.LibraryManager) {
 	}
 	author := strings.TrimSpace(sc.Text())
 
-	fmt.Print("Path to text file (optional): ")
+	fmt.Print("Content file path (or 'manual' to type content): ")
 	if !sc.Scan() {
 		return
 	}
-	path := strings.TrimSpace(sc.Text())
+	input := strings.TrimSpace(sc.Text())
 
-	var (
-		id  int64
-		err error
-	)
+	var id int64
+	var err error
 
-	if path == "" {
-		// No content yet
-		id, err = mgr.AddBook(title, author)
-	} else {
-		if _, errStat := os.Stat(filepath.Clean(path)); errStat != nil {
-			fmt.Printf("File error: %v. Adding book without content.\n", errStat)
-			id, err = mgr.AddBook(title, author)
-		} else {
-			id, err = mgr.AddBookFromFile(title, author, path)
+	if input == "manual" {
+		fmt.Print("Content: ")
+		if !sc.Scan() {
+			return
 		}
+		content := sc.Text()
+		id, err = mgr.AddBook(title, author)
+		if err == nil && content != "" {
+			err = mgr.UpdateBookContent(id, content)
+		}
+	} else {
+		// Try to read from file
+		if !filepath.IsAbs(input) {
+			input = filepath.Join(".", input)
+		}
+		id, err = mgr.AddBookFromFile(title, author, input)
 	}
 
 	if err != nil {
-		fmt.Printf("Error adding book: %v\n", err)
+		fmt.Printf("Error: %v\n", err)
 	} else {
-		if path == "" {
-			fmt.Printf("Added book ID %d (no content). Use 'update content' later.\n", id)
-		} else {
-			fmt.Printf("Added book ID %d with content.\n", id)
-		}
+		fmt.Printf("Added book with ID %d\n", id)
 	}
 }
 
@@ -121,7 +126,19 @@ func handleAddMember(sc *bufio.Scanner, mgr *library.LibraryManager) {
 	}
 	name := strings.TrimSpace(sc.Text())
 
-	id, err := mgr.AddMember(name)
+	fmt.Print("Password: ")
+	password, err := readPassword()
+	if err != nil {
+		fmt.Printf("Error reading password: %v\n", err)
+		return
+	}
+
+	if strings.TrimSpace(password) == "" {
+		fmt.Println("Password cannot be empty.")
+		return
+	}
+
+	id, err := mgr.AddMember(name, password)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 	} else {
@@ -129,89 +146,63 @@ func handleAddMember(sc *bufio.Scanner, mgr *library.LibraryManager) {
 	}
 }
 
-func handleListBooks(mgr *library.LibraryManager) {
-	books, err := mgr.GetAllBooks()
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-	if len(books) == 0 {
-		fmt.Println("No books in library.")
-		return
-	}
-
-	fmt.Printf("%-5s %-30s %-25s %-10s %-20s %s\n", "ID", "Title", "Author", "Available", "Borrower", "Reservation Queue")
-	fmt.Println(strings.Repeat("-", 120))
-
-	for _, b := range books {
-		// Get borrower information
-		var borrowerInfo string
-		if b.Available {
-			borrowerInfo = "None"
-		} else {
-			if member, err := mgr.GetMember(b.BorrowerID); err == nil {
-				borrowerInfo = fmt.Sprintf("%s (ID: %d)", member.Name, member.ID)
-			} else {
-				borrowerInfo = fmt.Sprintf("ID: %d", b.BorrowerID)
-			}
-		}
-
-		// Get reservation queue
-		reservations, err := mgr.GetReservations(b.ID)
-		var queueInfo string
-		if err != nil || len(reservations) == 0 {
-			queueInfo = "None"
-		} else {
-			var queueMembers []string
-			for i, member := range reservations {
-				queueMembers = append(queueMembers, fmt.Sprintf("%d. %s (ID: %d)", i+1, member.Name, member.ID))
-			}
-			queueInfo = strings.Join(queueMembers, ", ")
-		}
-
-		// Print book information
-		availStr := "Yes"
-		if !b.Available {
-			availStr = "No"
-		}
-
-		fmt.Printf("%-5d %-30s %-25s %-10s %-20s %s\n",
-			b.ID,
-			truncateString(b.Title, 30),
-			truncateString(b.Author, 25),
-			availStr,
-			truncateString(borrowerInfo, 20),
-			queueInfo)
-	}
-}
-
-func handleListMembers(mgr *library.LibraryManager) {
-	members, err := mgr.GetAllMembers()
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-	for _, m := range members {
-		fmt.Printf("%d: %s\n", m.ID, m.Name)
-	}
-}
-
-func handleSearchBooks(sc *bufio.Scanner, mgr *library.LibraryManager) {
-	fmt.Print("Query: ")
+func handleResetPassword(sc *bufio.Scanner, mgr *library.LibraryManager) {
+	fmt.Print("Member ID: ")
 	if !sc.Scan() {
 		return
 	}
-	q := strings.TrimSpace(sc.Text())
-	results, err := mgr.SearchBooks(q)
+	memberIDStr := strings.TrimSpace(sc.Text())
+	memberID, err := strconv.ParseInt(memberIDStr, 10, 64)
 	if err != nil {
-		fmt.Printf("Search error: %v\n", err)
+		fmt.Println("Invalid member ID.")
 		return
 	}
-	fmt.Printf("Found %d result(s)\n", len(results))
-	for _, b := range results {
-		fmt.Printf("%d: %s by %s\n", b.ID, b.Title, b.Author)
+
+	fmt.Print("New Password: ")
+	password, err := readPassword()
+	if err != nil {
+		fmt.Printf("Error reading password: %v\n", err)
+		return
+	}
+
+	if strings.TrimSpace(password) == "" {
+		fmt.Println("Password cannot be empty.")
+		return
+	}
+
+	if err := mgr.ResetMemberPassword(memberID, password); err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		fmt.Println("Password reset successfully.")
 	}
 }
+
+// Authentication helper for member operations
+func authenticateMember(sc *bufio.Scanner, mgr *library.LibraryManager) (int64, error) {
+	fmt.Print("Member ID: ")
+	if !sc.Scan() {
+		return 0, fmt.Errorf("failed to read member ID")
+	}
+	memberIDStr := strings.TrimSpace(sc.Text())
+	memberID, err := strconv.ParseInt(memberIDStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid member ID")
+	}
+
+	fmt.Print("Password: ")
+	password, err := readPassword()
+	if err != nil {
+		return 0, fmt.Errorf("error reading password: %w", err)
+	}
+
+	if err := mgr.AuthenticateMember(memberID, password); err != nil {
+		return 0, fmt.Errorf("authentication failed: %w", err)
+	}
+
+	return memberID, nil
+}
+
+// Updated member-oriented functions with authentication
 
 func handleCheckout(sc *bufio.Scanner, mgr *library.LibraryManager) {
 	fmt.Print("Book ID: ")
@@ -219,14 +210,18 @@ func handleCheckout(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		return
 	}
 	bookIDStr := strings.TrimSpace(sc.Text())
-	bookID, _ := strconv.ParseInt(bookIDStr, 10, 64)
-
-	fmt.Print("Member ID: ")
-	if !sc.Scan() {
+	bookID, err := strconv.ParseInt(bookIDStr, 10, 64)
+	if err != nil {
+		fmt.Println("Invalid book ID.")
 		return
 	}
-	memIDStr := strings.TrimSpace(sc.Text())
-	memberID, _ := strconv.ParseInt(memIDStr, 10, 64)
+
+	fmt.Println("Member authentication required:")
+	memberID, err := authenticateMember(sc, mgr)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
 
 	if err := mgr.CheckoutBook(bookID, memberID); err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -241,7 +236,35 @@ func handleReturn(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		return
 	}
 	bookIDStr := strings.TrimSpace(sc.Text())
-	bookID, _ := strconv.ParseInt(bookIDStr, 10, 64)
+	bookID, err := strconv.ParseInt(bookIDStr, 10, 64)
+	if err != nil {
+		fmt.Println("Invalid book ID.")
+		return
+	}
+
+	// Get book info to verify who has it checked out
+	book, err := mgr.GetBook(bookID)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	if book.Available {
+		fmt.Println("Error: Book is not checked out.")
+		return
+	}
+
+	fmt.Println("Member authentication required (must be the member who checked out the book):")
+	memberID, err := authenticateMember(sc, mgr)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	// Verify the authenticated member is the one who has the book
+	if book.BorrowerID != memberID {
+		fmt.Println("Error: You can only return books that you have checked out.")
+		return
+	}
 
 	returnedBy, assignedTo, err := mgr.ReturnBookWithDetails(bookID)
 	if err != nil {
@@ -268,14 +291,10 @@ func handleReserve(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		return
 	}
 
-	fmt.Print("Member ID: ")
-	if !sc.Scan() {
-		return
-	}
-	memIDStr := strings.TrimSpace(sc.Text())
-	memberID, err := strconv.ParseInt(memIDStr, 10, 64)
+	fmt.Println("Member authentication required:")
+	memberID, err := authenticateMember(sc, mgr)
 	if err != nil {
-		fmt.Println("Invalid member ID.")
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
@@ -298,8 +317,8 @@ func handleReserve(sc *bufio.Scanner, mgr *library.LibraryManager) {
 }
 
 func handleListReservations(sc *bufio.Scanner, mgr *library.LibraryManager) {
-	fmt.Println("1. List reservations for a book")
-	fmt.Println("2. List reservations for a member")
+	fmt.Println("1. List reservations for a book (admin)")
+	fmt.Println("2. List your reservations (member)")
 	fmt.Print("Choose option (1-2): ")
 
 	if !sc.Scan() {
@@ -309,6 +328,7 @@ func handleListReservations(sc *bufio.Scanner, mgr *library.LibraryManager) {
 
 	switch option {
 	case "1":
+		// Admin function - no authentication required
 		fmt.Print("Book ID: ")
 		if !sc.Scan() {
 			return
@@ -337,14 +357,11 @@ func handleListReservations(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		}
 
 	case "2":
-		fmt.Print("Member ID: ")
-		if !sc.Scan() {
-			return
-		}
-		memIDStr := strings.TrimSpace(sc.Text())
-		memberID, err := strconv.ParseInt(memIDStr, 10, 64)
+		// Member function - requires authentication
+		fmt.Println("Member authentication required:")
+		memberID, err := authenticateMember(sc, mgr)
 		if err != nil {
-			fmt.Println("Invalid member ID.")
+			fmt.Printf("Error: %v\n", err)
 			return
 		}
 
@@ -355,11 +372,11 @@ func handleListReservations(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		}
 
 		if len(reservations) == 0 {
-			fmt.Println("No active reservations for this member.")
+			fmt.Println("No active reservations for you.")
 			return
 		}
 
-		fmt.Printf("Active reservations for member %d:\n", memberID)
+		fmt.Printf("Your active reservations:\n")
 		for _, b := range reservations {
 			fmt.Printf("Book %d: %s by %s\n", b.ID, b.Title, b.Author)
 		}
@@ -381,14 +398,10 @@ func handleCancelReservation(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		return
 	}
 
-	fmt.Print("Member ID: ")
-	if !sc.Scan() {
-		return
-	}
-	memIDStr := strings.TrimSpace(sc.Text())
-	memberID, err := strconv.ParseInt(memIDStr, 10, 64)
+	fmt.Println("Member authentication required:")
+	memberID, err := authenticateMember(sc, mgr)
 	if err != nil {
-		fmt.Println("Invalid member ID.")
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
@@ -396,31 +409,6 @@ func handleCancelReservation(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		fmt.Printf("Error: %v\n", err)
 	} else {
 		fmt.Println("Reservation cancelled successfully.")
-	}
-}
-
-func handleUpdateContent(sc *bufio.Scanner, mgr *library.LibraryManager) {
-	fmt.Print("Book ID: ")
-	if !sc.Scan() {
-		return
-	}
-	idStr := strings.TrimSpace(sc.Text())
-	bookID, errConv := strconv.ParseInt(idStr, 10, 64)
-	if errConv != nil {
-		fmt.Println("Invalid book ID.")
-		return
-	}
-
-	fmt.Print("Path to text file: ")
-	if !sc.Scan() {
-		return
-	}
-	path := strings.TrimSpace(sc.Text())
-
-	if err := mgr.UpdateBookContentFromFile(bookID, path); err != nil {
-		fmt.Printf("Error: %v\n", err)
-	} else {
-		fmt.Println("Content updated.")
 	}
 }
 
@@ -436,14 +424,10 @@ func handleReadBook(sc *bufio.Scanner, mgr *library.LibraryManager) {
 		return
 	}
 
-	fmt.Print("Member ID: ")
-	if !sc.Scan() {
-		return
-	}
-	memberIDStr := strings.TrimSpace(sc.Text())
-	memberID, err := strconv.ParseInt(memberIDStr, 10, 64)
+	fmt.Println("Member authentication required:")
+	memberID, err := authenticateMember(sc, mgr)
 	if err != nil {
-		fmt.Println("Invalid member ID.")
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
@@ -452,12 +436,131 @@ func handleReadBook(sc *bufio.Scanner, mgr *library.LibraryManager) {
 	}
 }
 
-func truncateString(s string, maxLength int) string {
-	if len(s) <= maxLength {
-		return s
+// Utility function to read password securely
+func readPassword() (string, error) {
+	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
+	if err != nil {
+		return "", err
 	}
-	if maxLength <= 3 {
-		return s[:maxLength]
+	fmt.Println() // Print newline after password input
+	return string(bytePassword), nil
+}
+
+func handleListBooks(mgr *library.LibraryManager) {
+	books, err := mgr.GetAllBooks()
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
 	}
-	return s[:maxLength-3] + "..."
+
+	if len(books) == 0 {
+		fmt.Println("No books in the library.")
+		return
+	}
+
+	fmt.Println("Books in the library:")
+	for _, book := range books {
+		status := "Available"
+		if !book.Available {
+			status = fmt.Sprintf("Checked out by member %d", book.BorrowerID)
+		}
+		fmt.Printf("ID %d: %s by %s (%s)\n", book.ID, book.Title, book.Author, status)
+	}
+}
+
+func handleListMembers(mgr *library.LibraryManager) {
+	members, err := mgr.GetAllMembers()
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	if len(members) == 0 {
+		fmt.Println("No members in the library.")
+		return
+	}
+
+	fmt.Println("Library members:")
+	for _, member := range members {
+		fmt.Printf("ID %d: %s\n", member.ID, member.Name)
+	}
+}
+
+func handleSearchBooks(sc *bufio.Scanner, mgr *library.LibraryManager) {
+	fmt.Print("Search query: ")
+	if !sc.Scan() {
+		return
+	}
+	query := strings.TrimSpace(sc.Text())
+
+	if query == "" {
+		fmt.Println("Search query cannot be empty.")
+		return
+	}
+
+	books, err := mgr.SearchBooks(query)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	if len(books) == 0 {
+		fmt.Println("No books found matching your query.")
+		return
+	}
+
+	fmt.Printf("Found %d book(s) matching '%s':\n", len(books), query)
+	for _, book := range books {
+		status := "Available"
+		if !book.Available {
+			status = fmt.Sprintf("Checked out by member %d", book.BorrowerID)
+		}
+		fmt.Printf("ID %d: %s by %s (%s)\n", book.ID, book.Title, book.Author, status)
+	}
+}
+
+func handleUpdateContent(sc *bufio.Scanner, mgr *library.LibraryManager) {
+	fmt.Print("Book ID: ")
+	if !sc.Scan() {
+		return
+	}
+	bookIDStr := strings.TrimSpace(sc.Text())
+	bookID, err := strconv.ParseInt(bookIDStr, 10, 64)
+	if err != nil {
+		fmt.Println("Invalid book ID.")
+		return
+	}
+
+	fmt.Print("New content file path (or 'manual' to type content): ")
+	if !sc.Scan() {
+		return
+	}
+	input := strings.TrimSpace(sc.Text())
+
+	var content string
+
+	if input == "manual" {
+		fmt.Print("New content: ")
+		if !sc.Scan() {
+			return
+		}
+		content = sc.Text()
+	} else {
+		// Try to read from file
+		if !filepath.IsAbs(input) {
+			input = filepath.Join(".", input)
+		}
+		data, err := os.ReadFile(input)
+		if err != nil {
+			fmt.Printf("Error reading file: %v\n", err)
+			return
+		}
+		content = string(data)
+	}
+
+	if err := mgr.UpdateBookContent(bookID, content); err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		fmt.Println("Book content updated successfully.")
+	}
 }
